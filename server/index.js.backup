@@ -1,0 +1,2121 @@
+import express from 'express';
+import mysql from 'mysql2/promise';
+import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import cors from 'cors';
+import bcrypt from 'bcrypt';
+import crypto from 'crypto';
+import dotenv from 'dotenv';
+import Stripe from 'stripe';
+
+dotenv.config();
+
+// Initialize Stripe
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+const app = express();
+
+app.use(cors());
+app.use(express.json({ limit: "500mb" }));
+app.use(express.urlencoded({ extended: true, limit: "500mb" }));
+
+// configure upload directory
+const uploadDir = path.join(process.cwd(), 'data', 'uploads');
+fs.mkdirSync(uploadDir, { recursive: true });
+
+const upload = multer({ 
+  dest: uploadDir,
+  limits: {
+    fileSize: 500 * 1024 * 1024, // 500MB limit (for large audio/video files)
+  },
+  fileFilter: (req, file, cb) => {
+    // Accept images, audio, video, and cursor files
+    const allowedTypes = [
+      'image/jpeg',
+      'image/jpg', 
+      'image/png',
+      'image/gif',
+      'image/webp',
+      'image/svg+xml',
+      'audio/mpeg',
+      'audio/mp3',
+      'audio/wav',
+      'audio/ogg',
+      'video/mp4',
+      'video/webm',
+      'video/ogg',
+      'image/x-icon',
+      'image/vnd.microsoft.icon',
+      'image/x-win-bitmap'
+    ];
+    
+    // Also check file extension
+    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.mp3', '.wav', '.ogg', '.mp4', '.webm', '.cur', '.ico', '.bmp'];
+    const fileExtension = path.extname(file.originalname).toLowerCase();
+    
+    if (allowedTypes.includes(file.mimetype) || allowedExtensions.includes(fileExtension)) {
+      cb(null, true);
+    } else {
+      console.log('Rejected file:', file.originalname, 'Mimetype:', file.mimetype, 'Extension:', fileExtension);
+      cb(new Error('Invalid file type. Allowed types: images, audio, video, .cur files'));
+    }
+  },
+  onError: (err, next) => {
+    console.error('Multer error:', err);
+    next(err);
+  }
+});
+
+// MySQL pool
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  connectionLimit: 10
+});
+
+// Test DB connection
+pool.getConnection()
+  .then(conn => {
+    console.log("✅ Database connected");
+    conn.release();
+  })
+  .catch(err => {
+    console.error("❌ Database connection failed:", err.message);
+  });
+
+function authenticate(req, res, next) {
+  const auth = req.headers.authorization?.split(" ")[1];
+  if (!auth) return res.status(401).end();
+
+  try {
+    req.user = jwt.verify(auth, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).end();
+  }
+}
+
+/* =========================
+   AUTH
+========================= */
+
+app.post("/api/auth/register", async (req, res) => {
+
+  try {
+
+    const { username, email, password } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+
+      const [userResult] = await connection.execute(
+        "INSERT INTO users (username,email,password) VALUES (?,?,?)",
+        [username, email, hashedPassword]
+      );
+
+      const userId = userResult.insertId;
+
+      const [profileResult] = await connection.execute(
+        "INSERT INTO profiles (user_id, username, display_name, email) VALUES (?,?,?,?)",
+        [userId, username, username, email]
+      );
+
+      const profileId = profileResult.insertId;
+      
+      // Also create empty profile customization
+      await connection.execute(
+        "INSERT INTO profile_customization (user_id) VALUES (?)",
+        [userId]
+      );
+
+      await connection.commit();
+
+      const token = jwt.sign(
+        { sub: userId.toString(), email },
+        process.env.JWT_SECRET,
+        { expiresIn: "7d" }
+      );
+
+      res.json({ token });
+
+    } catch (error) {
+
+      await connection.rollback();
+
+      if (error.code === "ER_DUP_ENTRY") {
+        return res.status(400).json({ error: "User already exists" });
+      }
+
+      throw error;
+
+    } finally {
+      connection.release();
+    }
+
+  } catch (error) {
+    console.error("Register error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+
+app.post("/api/auth/login", async (req, res) => {
+
+  try {
+
+    const { email, password } = req.body;
+    console.log("Login attempt:", { email, password: password ? '***' : 'undefined' });
+
+    const [rows] = await pool.execute(
+      "SELECT * FROM users WHERE email=?",
+      [email]
+    );
+
+    const user = rows[0];
+    console.log("User found:", user ? 'yes' : 'no');
+
+    if (!user) {
+      console.log("User not found");
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    // Compare hashed password
+    console.log("Comparing password...");
+    const isValidPassword = await bcrypt.compare(password, user.password);
+    console.log("Password valid:", isValidPassword);
+    
+    if (!isValidPassword) {
+      console.log("Invalid password");
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    console.log("Creating token...");
+    const token = jwt.sign(
+      { sub: user.id.toString(), email },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    console.log("Login successful");
+    res.json({ token });
+
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+/* =========================
+   PROFILES
+========================= */
+
+app.get("/api/profiles/me", authenticate, async (req, res) => {
+
+  try {
+
+    const userId = req.user.sub;
+
+    const [rows] = await pool.execute(
+      "SELECT * FROM profiles WHERE user_id=?",
+      [userId]
+    );
+
+    res.json(rows[0] || null);
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+
+app.get("/api/profiles/:username", async (req, res) => {
+
+  try {
+
+    const { username } = req.params;
+    console.log("Searching for profile with username:", username);
+
+    const [rows] = await pool.execute(
+      "SELECT * FROM profiles WHERE username=?",
+      [username]
+    );
+
+    console.log("Found profiles:", rows.length);
+
+    if (rows.length === 0) {
+      // Check what usernames do exist
+      const [allProfiles] = await pool.execute("SELECT username, user_id FROM profiles LIMIT 10");
+      console.log("Available usernames:", allProfiles.map(p => ({ username: p.username, user_id: p.user_id })));
+      return res.status(404).json({ error: "Profile not found" });
+    }
+
+    console.log("Returning profile:", rows[0]);
+    res.json(rows[0]);
+
+  } catch (error) {
+    console.error("Profile fetch error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+app.put("/api/profiles/me", authenticate, async (req, res) => {
+
+  try {
+
+    const userId = req.user.sub;
+
+    const { username, display_name, description, avatar_url } = req.body;
+
+    // Convert undefined to null for SQL
+    const safeUsername = username ?? null;
+    const safeDisplayName = display_name ?? null;
+    const safeDescription = description ?? null;
+    const safeAvatarUrl = avatar_url ?? null;
+
+    const [existing] = await pool.execute(
+      "SELECT * FROM profiles WHERE user_id=?",
+      [userId]
+    );
+
+    if (existing.length === 0) {
+
+      await pool.execute(
+        "INSERT INTO profiles (user_id,username,display_name,description,avatar_url) VALUES (?,?,?,?,?)",
+        [userId, safeUsername, safeDisplayName, safeDescription, safeAvatarUrl]
+      );
+
+    } else {
+
+      // Build dynamic UPDATE query - only update fields that are provided
+      const updates = [];
+      const values = [];
+      
+      if (username !== undefined) {
+        updates.push("username=?");
+        values.push(username);
+      }
+      if (display_name !== undefined) {
+        updates.push("display_name=?");
+        values.push(display_name);
+      }
+      if (description !== undefined) {
+        updates.push("description=?");
+        values.push(description);
+      }
+      if (avatar_url !== undefined) {
+        updates.push("avatar_url=?");
+        values.push(avatar_url);
+      }
+      
+      if (updates.length > 0) {
+        const updateQuery = `UPDATE profiles SET ${updates.join(',')} WHERE user_id=?`;
+        values.push(userId);
+        await pool.execute(updateQuery, values);
+      }
+
+    }
+
+    res.sendStatus(204);
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+
+/* =========================
+   AUDIO UPLOADS (Non-premium)
+========================= */
+
+app.post("/api/audio-upload", authenticate, upload.single("file"), async (req, res) => {
+  try {
+    console.log("Audio upload request received");
+    
+    if (!req.file) {
+      console.log("No file in request");
+      return res.status(400).json({ error: "No file provided" });
+    }
+
+    // Check if file is audio
+    const audioTypes = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg'];
+    const audioExtensions = ['.mp3', '.wav', '.ogg'];
+    const fileExtension = path.extname(req.file.originalname).toLowerCase();
+    
+    if (!audioTypes.includes(req.file.mimetype) && !audioExtensions.includes(fileExtension)) {
+      return res.status(400).json({ error: "Only audio files are allowed" });
+    }
+
+    const file = req.file;
+    const userId = req.user.sub;
+    
+    console.log("Audio file details:", {
+      originalname: file.originalname,
+      filename: file.filename,
+      mimetype: file.mimetype,
+      size: file.size,
+      path: file.path
+    });
+
+    // Generate a unique URL for audio files
+    const audioUrl = `/audio/${file.filename}`;
+
+    console.log("Audio file saved with URL:", audioUrl);
+
+    res.json({
+      publicUrl: audioUrl,
+      filename: file.filename,
+      originalName: file.originalname,
+      mimetype: file.mimetype,
+      storagePath: file.path
+    });
+
+  } catch (error) {
+    console.error("Audio upload error:", error);
+    
+    // If file was uploaded but processing failed, clean up the file
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log("Cleaned up audio file after error:", req.file.path);
+      } catch (cleanupError) {
+        console.error("Failed to clean up audio file:", cleanupError);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: "Audio upload failed", 
+      details: error.message 
+    });
+  }
+});
+
+/* =========================
+   BACKGROUND UPLOADS (Non-premium)
+========================= */
+
+app.post("/api/background-upload", authenticate, upload.single("file"), async (req, res) => {
+  try {
+    console.log("Background upload request received");
+    
+    if (!req.file) {
+      console.log("No file in request");
+      return res.status(400).json({ error: "No file provided" });
+    }
+
+    // Check if file is an image
+    const imageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+    const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+    const fileExtension = path.extname(req.file.originalname).toLowerCase();
+    
+    if (!imageTypes.includes(req.file.mimetype) && !imageExtensions.includes(fileExtension)) {
+      return res.status(400).json({ error: "Only image files are allowed" });
+    }
+
+    const file = req.file;
+    const userId = req.user.sub;
+    
+    console.log("Background image details:", {
+      originalname: file.originalname,
+      filename: file.filename,
+      mimetype: file.mimetype,
+      size: file.size,
+      path: file.path
+    });
+
+    // Generate a unique URL for background images
+    const backgroundUrl = `/backgrounds/${file.filename}`;
+
+    console.log("Background image saved with URL:", backgroundUrl);
+
+    res.json({
+      publicUrl: backgroundUrl,
+      filename: file.filename,
+      originalName: file.originalname,
+      mimetype: file.mimetype,
+      storagePath: file.path
+    });
+
+  } catch (error) {
+    console.error("Background upload error:", error);
+    
+    // If file was uploaded but processing failed, clean up the file
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log("Cleaned up background file after error:", req.file.path);
+      } catch (cleanupError) {
+        console.error("Failed to clean up background file:", cleanupError);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: "Background upload failed", 
+      details: error.message 
+    });
+  }
+});
+
+/* =========================
+   PROFILE IMAGE UPLOADS (Non-premium)
+========================= */
+
+app.post("/api/profile-image-upload", authenticate, upload.single("file"), async (req, res) => {
+  try {
+    console.log("Profile image upload request received");
+    
+    if (!req.file) {
+      console.log("No file in request");
+      return res.status(400).json({ error: "No file provided" });
+    }
+
+    // Check if file is an image
+    const imageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+    const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+    const fileExtension = path.extname(req.file.originalname).toLowerCase();
+    
+    if (!imageTypes.includes(req.file.mimetype) && !imageExtensions.includes(fileExtension)) {
+      return res.status(400).json({ error: "Only image files are allowed" });
+    }
+
+    const file = req.file;
+    const userId = req.user.sub;
+    
+    console.log("Profile image details:", {
+      originalname: file.originalname,
+      filename: file.filename,
+      mimetype: file.mimetype,
+      size: file.size,
+      path: file.path
+    });
+
+    // Generate a unique URL for profile images
+    const profileImageUrl = `/profile-images/${file.filename}`;
+
+    console.log("Profile image saved with URL:", profileImageUrl);
+
+    res.json({
+      publicUrl: profileImageUrl,
+      filename: file.filename,
+      originalName: file.originalname,
+      mimetype: file.mimetype,
+      storagePath: file.path
+    });
+
+  } catch (error) {
+    console.error("Profile image upload error:", error);
+    
+    // If file was uploaded but processing failed, clean up the file
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log("Cleaned up profile image file after error:", req.file.path);
+      } catch (cleanupError) {
+        console.error("Failed to clean up profile image file:", cleanupError);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: "Profile image upload failed", 
+      details: error.message 
+    });
+  }
+});
+
+/* =========================
+   UPLOADS (Premium Only)
+========================= */
+
+app.get('/api/uploads', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Check if user has premium
+    const [profileRows] = await pool.execute('SELECT is_premium FROM profiles WHERE user_id = ?', [userId]);
+    if (profileRows.length === 0 || !profileRows[0].is_premium) {
+      return res.status(403).json({ error: 'Premium subscription required for image hosting' });
+    }
+    
+    // Check if table exists, if not create it
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS uploaded_files (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        file_name VARCHAR(255) NOT NULL,
+        original_name VARCHAR(255) NOT NULL,
+        file_size INT NOT NULL,
+        mime_type VARCHAR(100) NOT NULL,
+        storage_path TEXT NOT NULL,
+        public_url TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    
+    const [rows] = await pool.execute('SELECT * FROM uploaded_files WHERE user_id = ? ORDER BY created_at DESC', [userId]);
+    res.json(rows);
+  } catch (error) {
+    console.error("Uploads error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/uploads", authenticate, upload.single("file"), async (req, res) => {
+
+  try {
+    
+    console.log("Upload request received");
+    
+    if (!req.file) {
+      console.log("No file in request");
+      return res.status(400).json({ error: "No file provided" });
+    }
+
+    const file = req.file;
+    const userId = req.user.sub;
+    
+    // Check if user has premium
+    const [profileRows] = await pool.execute('SELECT is_premium FROM profiles WHERE user_id = ?', [userId]);
+    if (profileRows.length === 0 || !profileRows[0].is_premium) {
+      return res.status(403).json({ error: 'Premium subscription required for image hosting' });
+    }
+    
+    console.log("File details:", {
+      originalname: file.originalname,
+      filename: file.filename,
+      mimetype: file.mimetype,
+      size: file.size,
+      path: file.path
+    });
+
+    const [result] = await pool.execute(
+      "INSERT INTO uploaded_files (user_id,file_name,original_name,file_size,mime_type,storage_path,public_url) VALUES (?,?,?,?,?,?,?)",
+      [
+        userId,
+        file.filename,
+        file.originalname,
+        file.size,
+        file.mimetype,
+        file.path,
+        `/uploads/${file.filename}`
+      ]
+    );
+
+    console.log("File saved to database with ID:", result.insertId);
+
+    res.json({
+      id: result.insertId,
+      publicUrl: `/uploads/${file.filename}`,
+      filename: file.filename,
+      originalName: file.originalname,
+      mimetype: file.mimetype,
+      storagePath: file.path
+    });
+
+  } catch (error) {
+    console.error("Upload error:", error);
+    
+    // If file was uploaded but database insert failed, clean up the file
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log("Cleaned up file after database error:", req.file.path);
+      } catch (cleanupError) {
+        console.error("Failed to clean up file:", cleanupError);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: "Upload failed", 
+      details: error.message 
+    });
+  }
+
+});
+
+app.delete('/api/uploads/:id', authenticate, async (req, res) => {
+  try {
+    const fileId = req.params.id;
+    const userId = req.user.sub;
+    
+    // Check if file belongs to this user
+    const [rows] = await pool.execute('SELECT storage_path FROM uploaded_files WHERE id = ? AND user_id = ?', [fileId, userId]);
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'File not found or access denied' });
+    }
+    
+    const file = rows[0];
+    if (file) {
+      fs.unlinkSync(file.storage_path);
+    }
+    
+    await pool.execute('DELETE FROM uploaded_files WHERE id = ? AND user_id = ?', [fileId, userId]);
+    res.sendStatus(204);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete file" });
+  }
+});
+
+/* =========================
+   PROTECTED FILE SERVING
+========================= */
+
+// Serve audio files (non-premium)
+app.get('/audio/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const { token } = req.query;
+    
+    // Verify JWT token from URL
+    let userId;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.sub;
+      } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+    } else {
+      // Try to get token from Authorization header as fallback
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const decoded = jwt.verify(authHeader.substring(7), process.env.JWT_SECRET);
+          userId = decoded.sub;
+        } catch (error) {
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+      } else {
+        return res.status(401).json({ error: 'Authorization required' });
+      }
+    }
+    
+    // Construct the file path (audio files are stored in the general uploads directory)
+    const filePath = path.join(uploadDir, filename);
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+    
+    // Serve the file
+    res.sendFile(path.resolve(filePath));
+    
+  } catch (error) {
+    console.error('Audio file serving error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Serve profile image files (non-premium)
+app.get('/profile-images/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const { token } = req.query;
+    
+    // Verify JWT token from URL
+    let userId;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.sub;
+      } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+    } else {
+      // Try to get token from Authorization header as fallback
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const decoded = jwt.verify(authHeader.substring(7), process.env.JWT_SECRET);
+          userId = decoded.sub;
+        } catch (error) {
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+      } else {
+        return res.status(401).json({ error: 'Authorization required' });
+      }
+    }
+    
+    // Construct the file path (profile images are stored in the general uploads directory)
+    const filePath = path.join(uploadDir, filename);
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+    
+    // Serve the file
+    res.sendFile(path.resolve(filePath));
+    
+  } catch (error) {
+    console.error('Profile image serving error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Serve background image files (non-premium)
+app.get('/backgrounds/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const { token } = req.query;
+    
+    // Verify JWT token from URL
+    let userId;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.sub;
+      } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+    } else {
+      // Try to get token from Authorization header as fallback
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const decoded = jwt.verify(authHeader.substring(7), process.env.JWT_SECRET);
+          userId = decoded.sub;
+        } catch (error) {
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+      } else {
+        return res.status(401).json({ error: 'Authorization required' });
+      }
+    }
+    
+    // Construct the file path (background images are stored in the general uploads directory)
+    const filePath = path.join(uploadDir, filename);
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+    
+    // Serve the file
+    res.sendFile(path.resolve(filePath));
+    
+  } catch (error) {
+    console.error('Background image serving error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Serve premium uploaded files
+app.get('/uploads/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const { token } = req.query;
+    
+    // Verify JWT token from URL
+    let userId;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.sub;
+      } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+    } else {
+      // Try to get token from Authorization header as fallback
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const decoded = jwt.verify(authHeader.substring(7), process.env.JWT_SECRET);
+          userId = decoded.sub;
+        } catch (error) {
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+      } else {
+        return res.status(401).json({ error: 'Authorization required' });
+      }
+    }
+    
+    // Check if file belongs to this user
+    const [rows] = await pool.execute(
+      'SELECT storage_path FROM uploaded_files WHERE user_id = ? AND file_name = ?',
+      [userId, filename]
+    );
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    
+    const filePath = rows[0].storage_path;
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+    
+    // Serve the file
+    res.sendFile(path.resolve(filePath));
+    
+  } catch (error) {
+    console.error('File serving error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   SOCIAL LINKS
+========================= */
+
+app.get('/api/social-links', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) {
+      return res.status(400).json({ error: 'userId required' });
+    }
+    const [rows] = await pool.execute('SELECT * FROM social_links WHERE user_id = ? ORDER BY display_order', [userId]);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post("/api/social-links", authenticate, async (req, res) => {
+
+  try {
+
+    const userId = req.user.sub;
+
+    const { platform, url, display_order } = req.body;
+
+    const [result] = await pool.execute(
+      "INSERT INTO social_links (user_id,platform,url,display_order) VALUES (?,?,?,?)",
+      [userId, platform, url, display_order || 0]
+    );
+
+    res.json({
+      id: result.insertId,
+      platform,
+      url,
+      display_order
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+app.put('/api/social-links/:id', authenticate, async (req, res) => {
+  try {
+    const linkId = req.params.id;
+    const { url, display_order } = req.body;
+    await pool.execute('UPDATE social_links SET url = ?, display_order = ? WHERE id = ?', [url, display_order || 0, linkId]);
+    res.sendStatus(204);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/social-links/:id', authenticate, async (req, res) => {
+  try {
+    const linkId = req.params.id;
+    await pool.execute('DELETE FROM social_links WHERE id = ?', [linkId]);
+    res.sendStatus(204);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   BADGES
+========================= */
+
+app.get('/api/badges', async (req, res) => {
+  const [rows] = await pool.execute('SELECT * FROM badges ORDER BY name');
+  res.json(rows);
+});
+
+app.get('/api/user-badges', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const [rows] = await pool.execute(`
+      SELECT ub.*, b.name, b.description, b.icon, b.color, b.is_premium 
+      FROM user_badges ub 
+      JOIN badges b ON ub.badge_id = b.id 
+      WHERE ub.user_id = ? AND ub.enabled = true
+    `, [userId]);
+    res.json(rows);
+  } catch (error) {
+    console.error('Get user badges error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/user-badges', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { badgeId } = req.body;
+    if (!badgeId) return res.status(400).json({ error: 'badgeId required' });
+    
+    // Get badge info to check if it's premium
+    const [badgeInfo] = await pool.execute('SELECT * FROM badges WHERE id = ?', [badgeId]);
+    if (badgeInfo.length === 0) {
+      return res.status(404).json({ error: 'Badge not found' });
+    }
+    
+    const badge = badgeInfo[0];
+    
+    // Check if badge is premium and user has premium
+    if (badge.is_premium) {
+      const [profile] = await pool.execute('SELECT is_premium FROM profiles WHERE user_id = ?', [userId]);
+      if (profile.length === 0 || !profile[0].is_premium) {
+        return res.status(403).json({ error: 'Premium badge requires premium subscription' });
+      }
+    }
+    
+    // Check if user already has this badge
+    const [existing] = await pool.execute(
+      'SELECT * FROM user_badges WHERE user_id = ? AND badge_id = ?',
+      [userId, badgeId]
+    );
+    
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Badge already owned' });
+    }
+    
+    await pool.execute(
+      'INSERT INTO user_badges (user_id, badge_id, enabled) VALUES (?,?,?)',
+      [userId, badgeId, true]
+    );
+    
+    res.status(201).end();
+  } catch (error) {
+    console.error('Add user badge error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/user-badges/:id', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const badgeId = req.params.id;
+    await pool.execute('DELETE FROM user_badges WHERE user_id = ? AND badge_id = ?', [userId, badgeId]);
+    res.sendStatus(204);
+  } catch (error) {
+    console.error("Delete user badge error:", error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   ANALYTICS
+========================= */
+
+app.get('/api/analytics/views', authenticate, async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const [rows] = await pool.execute('SELECT * FROM profile_views WHERE profile_user_id = ? ORDER BY created_at DESC', [userId]);
+  res.json(rows);
+});
+
+app.post('/api/profile-views', async (req, res) => {
+  try {
+    const { profile_user_id, viewer_ip, user_agent, referrer, device_type } = req.body;
+    
+    await pool.execute(
+      'INSERT INTO profile_views (profile_user_id, viewer_ip, user_agent, referrer, device_type) VALUES (?,?,?,?,?)',
+      [profile_user_id, viewer_ip || req.ip, user_agent || req.get('User-Agent'), referrer || null, device_type || 'desktop']
+    );
+    
+    res.status(201).json({ success: true, message: 'Profile view recorded successfully' });
+  } catch (error) {
+    console.error('Profile views error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   PROFILE CUSTOMIZATION
+========================= */
+
+app.get("/api/profile-customization/:userId", authenticate, async (req, res) => {
+
+  try {
+
+    const { userId } = req.params;
+
+    if (req.user.sub !== userId) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const [rows] = await pool.execute(
+      "SELECT * FROM profile_customization WHERE user_id=?",
+      [userId]
+    );
+
+    res.json(rows[0] || null);
+
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+
+app.put("/api/profile-customization/:userId", authenticate, async (req, res) => {
+
+  try {
+
+    const { userId } = req.params;
+
+    if (req.user.sub !== userId) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const customization = req.body;
+
+    const [existing] = await pool.execute(
+      "SELECT * FROM profile_customization WHERE user_id=?",
+      [userId]
+    );
+
+    if (existing.length === 0) {
+
+      await pool.execute(
+        "INSERT INTO profile_customization (user_id) VALUES (?)",
+        [userId]
+      );
+
+    } else {
+
+      const setClause = Object.keys(customization).map(key => `${key} = ?`).join(', ');
+      
+      const values = Object.keys(customization).map(key => {
+        const value = customization[key];
+        if (key === 'audio_files' && Array.isArray(value)) {
+          return JSON.stringify(value);
+        }
+        return value;
+      });
+      
+      if (setClause.length === 0) {
+        res.sendStatus(204);
+        return;
+      }
+      
+      const allValues = [...values, userId];
+      
+      await pool.execute(`UPDATE profile_customization SET ${setClause} WHERE user_id = ?`, 
+        allValues);
+    }
+
+    res.sendStatus(204);
+
+  } catch (error) {
+    console.error("Profile customization PUT error:", error);
+    res.status(500).json({ 
+      error: "Internal server error",
+      details: error.message,
+      sqlError: error.sqlMessage 
+    });
+  }
+
+});
+
+/* =========================
+   PUBLIC ENDPOINTS
+========================= */
+
+app.get('/api/public/profile-customization/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const [rows] = await pool.execute(
+      'SELECT * FROM profile_customization WHERE user_id = ?',
+      [userId]
+    );
+    res.json(rows[0] || {});
+  } catch (error) {
+    console.error('Public profile customization error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/public/user-badges/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const [rows] = await pool.execute(`
+      SELECT ub.*, b.name, b.description, b.icon, b.color, b.is_premium 
+      FROM user_badges ub 
+      JOIN badges b ON ub.badge_id = b.id 
+      WHERE ub.user_id = ? AND ub.enabled = true
+    `, [userId]);
+    res.json(rows);
+  } catch (error) {
+    console.error('Public user badges error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   BADGE VERIFICATION
+========================= */
+
+app.post('/api/request-badge', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { badgeId } = req.body;
+    
+    const [badgeRows] = await pool.execute(
+      'SELECT * FROM badges WHERE id = ?',
+      [badgeId]
+    );
+    const badge = badgeRows[0];
+    
+    if (!badge) {
+      return res.status(404).json({ error: 'Badge not found' });
+    }
+    
+    if (badge?.badge_type === 'developer') {
+      if (req.user.sub !== '1') {
+        return res.status(403).json({ error: 'Only owner can request this badge' });
+      }
+    }
+    
+    if (badge?.badge_type === 'early_supporter') {
+      const [userRows] = await pool.execute(
+        'SELECT email_verified FROM users WHERE id = ?',
+        [userId]
+      );
+      const user = userRows[0];
+      
+      if (!user.email_verified) {
+        return res.status(403).json({ error: 'Email verification required for this badge' });
+      }
+    }
+    
+    if (badge.badge_type === 'free' || (!badge.badge_type && !badge.is_premium)) {
+      return res.json({ 
+        success: true, 
+        message: 'Free badge activated',
+        requiresVerification: false 
+      });
+    }
+    
+    const [existingRequest] = await pool.execute(
+      'SELECT * FROM badge_verification_requests WHERE user_id = ? AND badge_id = ?',
+      [userId, badgeId]
+    );
+    
+    if (existingRequest.length > 0) {
+      return res.json({ 
+        success: false, 
+        message: 'Badge already requested',
+        status: existingRequest[0].status 
+      });
+    }
+    
+    await pool.execute(
+      'INSERT INTO badge_verification_requests (user_id, badge_id, status) VALUES (?, ?, ?)',
+      [userId, badgeId, 'pending']
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Badge verification request submitted',
+      requiresVerification: true,
+      status: 'pending'
+    });
+    
+  } catch (error) {
+    console.error('Request badge error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/approve-badge', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    if (userId !== '1') {
+      return res.status(403).json({ error: 'Only owner can approve badges' });
+    }
+    
+    const { requestId, userId: targetUserId, badgeId } = req.body;
+    
+    await pool.execute(
+      'UPDATE badge_verification_requests SET status = ?, approved_by = ?, approved_at = NOW() WHERE id = ?',
+      ['approved', userId, requestId]
+    );
+    
+    await pool.execute(
+      'INSERT INTO user_badges (user_id, badge_id, enabled) VALUES (?, ?, ?)',
+      [targetUserId, badgeId, true]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Badge approved and activated' 
+    });
+    
+  } catch (error) {
+    console.error('Approve badge error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/verification-requests', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    if (userId !== '1') {
+      return res.status(403).json({ error: 'Only owner can view verification requests' });
+    }
+    
+    const [rows] = await pool.execute(`
+      SELECT vr.*, u.username, u.email, b.name as badge_name, b.badge_type
+      FROM badge_verification_requests vr
+      JOIN users u ON vr.user_id = u.id
+      JOIN badges b ON vr.badge_id = b.id
+      ORDER BY vr.created_at DESC
+    `);
+    
+    res.json(rows);
+    
+  } catch (error) {
+    console.error('List verification requests error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   ADMIN / ROLES
+========================= */
+
+app.post('/api/add-admin', authenticate, async (req, res) => {
+  try {
+    const requesterId = req.user.sub;
+    if (requesterId !== '1') {
+      return res.status(403).json({ error: 'Only owner can add admin roles' });
+    }
+    
+    const { userId } = req.body;
+    
+    await pool.execute(
+      'INSERT INTO user_roles (user_id, role) VALUES (?, ?)',
+      [userId, 'admin']
+    );
+    
+    res.json({ success: true, message: 'Admin role added' });
+  } catch (error) {
+    console.error('Add admin error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/remove-admin', authenticate, async (req, res) => {
+  try {
+    const requesterId = req.user.sub;
+    if (requesterId !== '1') {
+      return res.status(403).json({ error: 'Only owner can remove admin roles' });
+    }
+    
+    const { userId } = req.body;
+    
+    await pool.execute(
+      'DELETE FROM user_roles WHERE user_id = ? AND role = ?',
+      [userId, 'admin']
+    );
+    
+    res.json({ success: true, message: 'Admin role removed' });
+  } catch (error) {
+    console.error('Remove admin error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/admins', authenticate, async (req, res) => {
+  try {
+    const requesterId = req.user.sub;
+    if (requesterId !== '1') {
+      return res.status(403).json({ error: 'Only owner can view admins' });
+    }
+    
+    const [rows] = await pool.execute(`
+      SELECT u.id, u.username, u.email, ur.created_at as admin_since
+      FROM users u
+      JOIN user_roles ur ON u.id = ur.user_id
+      WHERE ur.role = 'admin'
+      ORDER BY ur.created_at DESC
+    `);
+    
+    res.json(rows);
+  } catch (error) {
+    console.error('List admins error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/check-owner', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const isOwner = userId === '1';
+    res.json({ isOwner });
+  } catch (error) {
+    console.error('Check owner error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   DB SETUP HELPERS
+========================= */
+
+app.post('/api/create-user-roles-table', async (req, res) => {
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS user_roles (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        role ENUM('admin', 'moderator') NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE KEY unique_user_role (user_id, role)
+      )
+    `);
+    
+    res.json({ success: true, message: 'User roles table created' });
+  } catch (error) {
+    console.error('Create user roles table error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/create-badge-verification-table', async (req, res) => {
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS badge_verification_requests (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        badge_id INT NOT NULL,
+        status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+        requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        approved_by INT NULL,
+        approved_at TIMESTAMP NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (badge_id) REFERENCES badges(id) ON DELETE CASCADE,
+        UNIQUE KEY unique_user_badge (user_id, badge_id)
+      )
+    `);
+    
+    res.json({ success: true, message: 'Badge verification table created' });
+  } catch (error) {
+    console.error('Create badge verification table error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/update-badges-structure', async (req, res) => {
+  try {
+    await pool.execute(`
+      ALTER TABLE badges 
+      ADD COLUMN badge_type ENUM('free', 'premium', 'developer', 'early_supporter') DEFAULT 'free'
+    `);
+    
+    await pool.execute(`
+      ALTER TABLE badges 
+      ADD COLUMN admin_only BOOLEAN DEFAULT FALSE
+    `);
+    
+    await pool.execute(`
+      UPDATE badges SET is_premium = TRUE WHERE id IN (1, 2, 3)
+    `);
+    
+    res.json({ success: true, message: 'Badges table updated with premium badges' });
+  } catch (error) {
+    console.error('Update badges structure error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================
+   DB STATUS
+========================= */
+
+app.get('/api/db-status', async (req, res) => {
+  try {
+    const [tables] = await pool.execute('SHOW TABLES');
+    const [userCount] = await pool.execute('SELECT COUNT(*) as count FROM users');
+    const [profileCount] = await pool.execute('SELECT COUNT(*) as count FROM profiles');
+    
+    res.json({
+      tables: tables.map(t => Object.values(t)[0]),
+      userCount: userCount[0].count,
+      profileCount: profileCount[0].count,
+      status: 'connected'
+    });
+  } catch (error) {
+    console.error('DB status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================
+   TEMPLATES
+========================= */
+
+app.post('/api/create-templates-table', async (req, res) => {
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS templates (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        author_id INT NOT NULL,
+        author_username VARCHAR(100),
+        preview_image VARCHAR(255),
+        category VARCHAR(100),
+        tags JSON,
+        is_premium BOOLEAN DEFAULT FALSE,
+        is_public BOOLEAN DEFAULT TRUE,
+        uses INT DEFAULT 0,
+        downloads INT DEFAULT 0,
+        rating DECIMAL(3,2) DEFAULT 0.00,
+        status ENUM('draft', 'published', 'archived') DEFAULT 'draft',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    
+    res.json({ success: true, message: 'Templates table created' });
+  } catch (error) {
+    console.error('Create templates table error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/templates', async (req, res) => {
+  try {
+    const { category, search, sort = 'created_at', order = 'DESC', limit = 50, offset = 0 } = req.query;
+    
+    let query = `
+      SELECT t.*, u.username as author_username,
+             (SELECT COUNT(*) FROM template_downloads td WHERE td.template_id = t.id) as download_count
+      FROM templates t
+      JOIN users u ON t.author_id = u.id
+      WHERE t.status = 'published' AND t.is_public = true
+    `;
+    
+    const params = [];
+    
+    if (category) {
+      query += ' AND t.category = ?';
+      params.push(category);
+    }
+    
+    if (search) {
+      query += ' AND (t.name LIKE ? OR t.description LIKE ? OR JSON_CONTAINS(t.tags, ?))';
+      const searchParam = `%${search}%`;
+      params.push(searchParam, searchParam, `"${search}"`);
+    }
+    
+    const allowedSorts = ['created_at', 'uses', 'downloads', 'rating', 'name'];
+    const sortField = allowedSorts.includes(sort) ? sort : 'created_at';
+    const sortOrder = order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+    query += ` ORDER BY t.${sortField} ${sortOrder}`;
+    
+    query += ' LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const [templates] = await pool.execute(query, params);
+    
+    let countQuery = `
+      SELECT COUNT(*) as total 
+      FROM templates t 
+      WHERE t.status = 'published' AND t.is_public = true
+    `;
+    const countParams = [];
+    
+    if (category) {
+      countQuery += ' AND t.category = ?';
+      countParams.push(category);
+    }
+    
+    if (search) {
+      countQuery += ' AND (t.name LIKE ? OR t.description LIKE ? OR JSON_CONTAINS(t.tags, ?))';
+      const searchParam = `%${search}%`;
+      countParams.push(searchParam, searchParam, `"${search}"`);
+    }
+    
+    const [countResult] = await pool.execute(countQuery, countParams);
+    
+    res.json({
+      templates,
+      total: countResult[0].total,
+      hasMore: (parseInt(offset) + parseInt(limit)) < countResult[0].total
+    });
+  } catch (error) {
+    console.error('Get templates error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/templates/:id', async (req, res) => {
+  try {
+    const templateId = req.params.id;
+    
+    const [templates] = await pool.execute(`
+      SELECT t.*, u.username as author_username,
+             (SELECT COUNT(*) FROM template_downloads td WHERE td.template_id = t.id) as download_count
+      FROM templates t
+      JOIN users u ON t.author_id = u.id
+      WHERE t.id = ? AND t.status = 'published' AND t.is_public = true
+    `, [templateId]);
+    
+    if (templates.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    await pool.execute(
+      'UPDATE templates SET uses = uses + 1 WHERE id = ?',
+      [templateId]
+    );
+    
+    res.json(templates[0]);
+  } catch (error) {
+    console.error('Get template error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/templates', authenticate, upload.single('preview'), async (req, res) => {
+  try {
+    const { name, description, category, tags, is_premium = false, is_public = true } = req.body;
+    const authorId = req.user.sub;
+    const authorUsername = req.user.username;
+    
+    if (!name || !description || !category) {
+      return res.status(400).json({ error: 'Name, description, and category are required' });
+    }
+    
+    let parsedTags = [];
+    if (tags) {
+      try {
+        parsedTags = typeof tags === 'string' ? JSON.parse(tags) : tags;
+      } catch (error) {
+        parsedTags = tags.split(',').map(tag => tag.trim()).filter(Boolean);
+      }
+    }
+    
+    const previewImage = req.file ? `/uploads/${req.file.filename}` : null;
+    
+    const [result] = await pool.execute(`
+      INSERT INTO templates (name, description, author_id, author_username, preview_image, category, tags, is_premium, is_public, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published')
+    `, [
+      name,
+      description,
+      authorId,
+      authorUsername,
+      previewImage,
+      category,
+      JSON.stringify(parsedTags),
+      is_premium,
+      is_public
+    ]);
+    
+    const [templates] = await pool.execute('SELECT * FROM templates WHERE id = ?', [result.insertId]);
+    
+    res.status(201).json({
+      success: true,
+      template: templates[0],
+      message: 'Template created successfully'
+    });
+  } catch (error) {
+    console.error('Create template error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/my-templates', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    const [templates] = await pool.execute(`
+      SELECT t.*, 
+             (SELECT COUNT(*) FROM template_downloads td WHERE td.template_id = t.id) as download_count
+      FROM templates t
+      WHERE t.author_id = ?
+      ORDER BY t.created_at DESC
+    `, [userId]);
+    
+    res.json(templates);
+  } catch (error) {
+    console.error('Get my templates error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/templates/:id', authenticate, async (req, res) => {
+  try {
+    const templateId = req.params.id;
+    const { name, description, category, tags, is_premium, is_public, status } = req.body;
+    const userId = req.user.sub;
+    
+    const [templates] = await pool.execute(
+      'SELECT author_id FROM templates WHERE id = ?',
+      [templateId]
+    );
+    
+    if (templates.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    if (templates[0].author_id !== userId) {
+      return res.status(403).json({ error: 'You can only edit your own templates' });
+    }
+    
+    let parsedTags = tags;
+    if (tags && typeof tags === 'string') {
+      try {
+        parsedTags = JSON.parse(tags);
+      } catch (error) {
+        parsedTags = tags.split(',').map(tag => tag.trim()).filter(Boolean);
+      }
+    }
+    
+    const updateFields = [];
+    const updateValues = [];
+    
+    if (name !== undefined) { updateFields.push('name = ?'); updateValues.push(name); }
+    if (description !== undefined) { updateFields.push('description = ?'); updateValues.push(description); }
+    if (category !== undefined) { updateFields.push('category = ?'); updateValues.push(category); }
+    if (tags !== undefined) { updateFields.push('tags = ?'); updateValues.push(JSON.stringify(parsedTags)); }
+    if (is_premium !== undefined) { updateFields.push('is_premium = ?'); updateValues.push(is_premium); }
+    if (is_public !== undefined) { updateFields.push('is_public = ?'); updateValues.push(is_public); }
+    if (status !== undefined) { updateFields.push('status = ?'); updateValues.push(status); }
+    
+    if (updateFields.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    updateValues.push(templateId);
+    
+    await pool.execute(
+      `UPDATE templates SET ${updateFields.join(', ')} WHERE id = ?`,
+      updateValues
+    );
+    
+    res.json({ success: true, message: 'Template updated successfully' });
+  } catch (error) {
+    console.error('Update template error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/templates/:id', authenticate, async (req, res) => {
+  try {
+    const templateId = req.params.id;
+    const userId = req.user.sub;
+    
+    const [templates] = await pool.execute(
+      'SELECT author_id FROM templates WHERE id = ?',
+      [templateId]
+    );
+    
+    if (templates.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    if (templates[0].author_id !== userId) {
+      return res.status(403).json({ error: 'You can only delete your own templates' });
+    }
+    
+    await pool.execute('DELETE FROM templates WHERE id = ?', [templateId]);
+    
+    res.json({ success: true, message: 'Template deleted successfully' });
+  } catch (error) {
+    console.error('Delete template error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   PROFILE UTILS
+========================= */
+
+app.post('/api/ensure-profile', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { username, email } = req.body;
+    
+    const [existing] = await pool.execute(
+      'SELECT * FROM profiles WHERE user_id = ?',
+      [userId]
+    );
+    
+    if (existing.length === 0) {
+      const [profileResult] = await pool.execute(
+        'INSERT INTO profiles (user_id, username, display_name, email) VALUES (?,?,?,?)',
+        [userId, username, username, email]
+      );
+      res.json({ success: true, created: true, profileId: profileResult.insertId });
+    } else {
+      res.json({ success: true, created: false, profile: existing[0] });
+    }
+  } catch (error) {
+    console.error('Ensure profile error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/fix-profile-username', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { username } = req.body;
+    
+    await pool.execute(
+      'UPDATE profiles SET username = ? WHERE user_id = ?',
+      [username, userId]
+    );
+    
+    res.json({ success: true, message: 'Profile username updated' });
+  } catch (error) {
+    console.error('Fix profile username error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/profiles/me/discord', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { discord_username, discord_id, discord_avatar } = req.body;
+    
+    await pool.execute(
+      'UPDATE profiles SET discord_connected = true, discord_username = ?, discord_avatar_url = ? WHERE user_id = ?',
+      [discord_username, discord_avatar ? `https://cdn.discordapp.com/avatars/${discord_id}/${discord_avatar}.png` : null, userId]
+    );
+    
+    res.json({ success: true, message: 'Discord connected successfully' });
+    
+  } catch (error) {
+    console.error('Discord connect error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/profiles/me/username', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { username } = req.body;
+    
+    if (!username || username.trim().length === 0) {
+      return res.status(400).json({ error: 'Username is required' });
+    }
+    
+    if (username.trim().length < 3) {
+      return res.status(400).json({ error: 'Username must be at least 3 characters long' });
+    }
+    
+    const [existing] = await pool.execute(
+      'SELECT id FROM profiles WHERE username = ? AND user_id != ?',
+      [username.trim(), userId]
+    );
+    
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Username is already taken' });
+    }
+    
+    await pool.execute(
+      'UPDATE profiles SET username = ? WHERE user_id = ?',
+      [username.trim(), userId]
+    );
+    
+    res.json({ success: true, message: 'Username updated successfully' });
+    
+  } catch (error) {
+    console.error('Update username error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/profiles/me/display-name', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { display_name } = req.body;
+    
+    if (!display_name || display_name.trim().length === 0) {
+      return res.status(400).json({ error: 'Display name is required' });
+    }
+    
+    if (display_name.trim().length > 50) {
+      return res.status(400).json({ error: 'Display name must be less than 50 characters' });
+    }
+    
+    await pool.execute(
+      'UPDATE profiles SET display_name = ? WHERE user_id = ?',
+      [display_name.trim(), userId]
+    );
+    
+    res.json({ success: true, message: 'Display name updated successfully' });
+    
+  } catch (error) {
+    console.error('Update display name error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   DISCORD OAUTH
+========================= */
+
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
+const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI || 'http://localhost:3001/api/auth/discord/callback';
+
+app.get('/api/auth/discord', (req, res) => {
+  if (!DISCORD_CLIENT_ID) {
+    return res.status(500).json({ error: 'Discord OAuth not configured' });
+  }
+  
+  const scope = 'identify email';
+  const authUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}&response_type=code&scope=${scope}`;
+  
+  res.redirect(authUrl);
+});
+
+app.get('/api/auth/discord/callback', async (req, res) => {
+  try {
+    const { code } = req.query;
+    
+    if (!code) {
+      return res.status(400).json({ error: 'Authorization code required' });
+    }
+    
+    if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
+      return res.status(500).json({ error: 'Discord OAuth not configured' });
+    }
+    
+    const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        client_id: DISCORD_CLIENT_ID,
+        client_secret: DISCORD_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code: code.toString(),
+        redirect_uri: DISCORD_REDIRECT_URI,
+      }),
+    });
+    
+    const tokenData = await tokenResponse.json();
+    
+    if (tokenData.error) {
+      return res.status(400).json({ error: 'Failed to exchange code for token' });
+    }
+    
+    const userResponse = await fetch('https://discord.com/api/users/@me', {
+      headers: {
+        'Authorization': `Bearer ${tokenData.access_token}`,
+      },
+    });
+    
+    const userData = await userResponse.json();
+    
+    if (userData.error) {
+      return res.status(400).json({ error: 'Failed to get user info from Discord' });
+    }
+    
+    res.redirect(`http://localhost:8080/dashboard?discord_connected=true&discord_username=${userData.username}&discord_id=${userData.id}&discord_avatar=${userData.avatar}`);
+    
+  } catch (error) {
+    console.error('Discord OAuth callback error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   STRIPE PAYMENTS
+========================= */
+
+app.post('/api/create-checkout-session', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { priceId, successUrl, cancelUrl } = req.body;
+
+    if (!priceId || !successUrl || !cancelUrl) {
+      return res.status(400).json({ error: 'Missing required parameters' });
+    }
+
+    // Get user info for Stripe metadata
+    const [userRows] = await pool.execute(
+      'SELECT u.email, p.username FROM users u JOIN profiles p ON u.id = p.user_id WHERE u.id = ?',
+      [userId]
+    );
+
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = userRows[0];
+
+    // Create Stripe checkout session
+    const session = await stripe.checkout.sessions.create({
+      customer_email: user.email,
+      billing_address_collection: 'auto',
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
+        },
+      ],
+      mode: 'subscription',
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: {
+        userId: userId.toString(),
+        username: user.username || user.email.split('@')[0],
+      },
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Stripe checkout session error:', error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// Cancel premium subscription
+app.post('/api/cancel-subscription', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Get user's Stripe customer ID
+    const [profileRows] = await pool.execute(
+      'SELECT stripe_customer_id FROM profiles WHERE user_id = ?',
+      [userId]
+    );
+    
+    if (profileRows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const profile = profileRows[0];
+    
+    if (!profile.stripe_customer_id) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+    
+    // Get active subscriptions for this customer
+    const subscriptions = await stripe.subscriptions.list({
+      customer: profile.stripe_customer_id,
+      status: 'active'
+    });
+    
+    if (subscriptions.data.length === 0) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+    
+    // Cancel the subscription at period end
+    const subscription = await stripe.subscriptions.update(
+      subscriptions.data[0].id,
+      { cancel_at_period_end: true }
+    );
+    
+    res.json({ 
+      message: 'Subscription will be cancelled at the end of the billing period',
+      cancelAt: subscriptions.data[0].current_period_end * 1000 // Convert to milliseconds
+    });
+    
+  } catch (error) {
+    console.error('Cancel subscription error:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+});
+
+// Stripe webhook handler for payment completion
+app.post('/api/stripe/webhook', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.log(`Webhook signature verification failed.`, err.message);
+    return res.status(400).send(`Webhook signature verification failed.`);
+  }
+
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      const userId = session.metadata.userId;
+
+      if (userId) {
+        // Update user to premium
+        await pool.execute(
+          'UPDATE profiles SET is_premium = true, stripe_customer_id = ?, updated_at = NOW() WHERE user_id = ?',
+          [session.customer, userId]
+        );
+        
+        console.log(`User ${userId} upgraded to premium`);
+      }
+      break;
+    
+    case 'invoice.payment_failed':
+      const failedSession = event.data.object;
+      const failedUserId = failedSession.metadata?.userId;
+      
+      if (failedUserId) {
+        console.log(`Payment failed for user ${failedUserId}`);
+        // Optionally handle payment failure (e.g., send email, revoke premium)
+      }
+      break;
+    
+    default:
+      console.log(`Unhandled event type ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+/* =========================
+   ERROR HANDLERS
+========================= */
+
+app.use((err, req, res, next) => {
+  console.error("Global error:", err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
+});
+
+/* =========================
+   SERVER
+========================= */
+
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, () => {
+  console.log(`API running on http://localhost:${PORT}`);
+});

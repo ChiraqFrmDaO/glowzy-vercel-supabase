@@ -1,0 +1,4140 @@
+import express from 'express';
+import mysql from 'mysql2/promise';
+import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import { readdirSync } from 'fs';
+import cors from 'cors';
+import bcrypt from 'bcrypt';
+import crypto from 'crypto';
+import dotenv from 'dotenv';
+import Stripe from 'stripe';
+import { TOTP, NobleCryptoPlugin, ScureBase32Plugin } from 'otplib';
+import QRCode from 'qrcode';
+// Add raw body parser for Stripe webhooks
+import bodyParser from 'body-parser';
+
+// Initialize TOTP with crypto and base32 plugins
+const totp = new TOTP({
+  crypto: new NobleCryptoPlugin(),
+  base32: new ScureBase32Plugin()
+});
+
+dotenv.config();
+
+// Initialize Stripe
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2022-11-15",
+});
+
+const app = express();
+
+app.use(cors());
+
+// ⚠️ Stripe webhook MOET raw body hebben — VOOR express.json()
+app.post('/api/stripe/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.log('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const type = session.metadata?.type; // 'premium' of 'glowzycoins'
+    const userId = session.metadata?.userId || session.metadata?.user_id;
+
+    try {
+      if (type === 'premium' && userId) {
+        // Gebruiker krijgt premium
+        await pool.execute(
+          'UPDATE profiles SET is_premium = true, stripe_customer_id = ?, updated_at = NOW() WHERE user_id = ?',
+          [session.customer, userId]
+        );
+        console.log(`✅ User ${userId} upgraded to premium`);
+
+      } else if (type === 'glowzycoins' && userId) {
+        // Gebruiker krijgt Glowzycoins
+        const glowzycoins = parseInt(session.metadata.glowzycoins);
+        await pool.execute(
+          'INSERT INTO user_glowzycoin (user_id, balance) VALUES (?, ?) ON DUPLICATE KEY UPDATE balance = balance + ?',
+          [userId, glowzycoins, glowzycoins]
+        );
+        await pool.execute(
+          'INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, reference_id, description) VALUES (?, ?, ?, ?, ?)',
+          [userId, glowzycoins, 'purchase', session.id, `Purchase of ${glowzycoins} Glowzycoins`]
+        );
+        console.log(`✅ Added ${glowzycoins} Glowzycoins to user ${userId}`);
+      } else if (type === 'product' && userId) {
+  const productName = session.metadata.product_name;
+  console.log(`✅ User ${userId} purchased: ${productName}`);
+
+  const PRODUCT_BADGE_MAP = {
+    "Verified Badge": "Verified",
+    "Custom Badge":   "Custom Badge",
+    "Donator Badge":  "Donor",
+    "Rich Badge":     "Rich",
+    "Gold Badge":     "Gold",
+    "Atlas Token":    "Atlas Token",
+  };
+
+  const badgeName = PRODUCT_BADGE_MAP[productName];
+  if (badgeName) {
+    const [badgeRows] = await pool.execute(
+      'SELECT id FROM badges WHERE name = ?',
+      [badgeName]
+    );
+    if (badgeRows.length > 0) {
+      await pool.execute(
+        'INSERT IGNORE INTO user_badges (user_id, badge_id, enabled) VALUES (?, ?, true)',
+        [userId, badgeRows[0].id]
+      );
+      console.log(`✅ Badge "${badgeName}" granted to user ${userId}`);
+    }
+  }
+}
+    } catch (err) {
+      console.error('❌ Error processing webhook:', err);
+    }
+  }
+
+  if (event.type === 'invoice.payment_failed') {
+    const invoice = event.data.object;
+    console.log(`⚠️ Payment failed for customer ${invoice.customer}`);
+    // Optioneel: premium intrekken
+  }
+
+  res.json({ received: true });
+});
+
+app.use(express.json({ limit: "500mb" }));
+app.use(express.urlencoded({ extended: true, limit: "500mb" }));
+app.use("/assets", express.static(path.join(path.dirname(new URL(import.meta.url).pathname), "../dist/assets")));
+app.use(express.static(path.join(path.dirname(new URL(import.meta.url).pathname), "../dist")));
+
+// configure upload directory
+const uploadDir = path.join(process.cwd(), 'data', 'uploads');
+fs.mkdirSync(uploadDir, { recursive: true });
+
+// Serve uploaded files publicly (template preview images, etc.)
+app.use('/uploads', express.static(uploadDir));
+
+const upload = multer({ 
+  dest: uploadDir,
+  limits: {
+    fileSize: 500 * 1024 * 1024, // 500MB limit (for large audio/video files)
+  },
+  fileFilter: (req, file, cb) => {
+    // Accept images, audio, video, and cursor files
+    const allowedTypes = [
+      'image/jpeg',
+      'image/jpg', 
+      'image/png',
+      'image/gif',
+      'image/webp',
+      'image/svg+xml',
+      'audio/mpeg',
+      'audio/mp3',
+      'audio/wav',
+      'audio/ogg',
+      'video/mp4',
+      'video/webm',
+      'video/ogg',
+      'image/x-icon',
+      'image/vnd.microsoft.icon',
+      'image/x-win-bitmap'
+    ];
+    
+    // Also check file extension
+    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.mp3', '.wav', '.ogg', '.mp4', '.webm', '.cur', '.ico', '.bmp'];
+    const fileExtension = path.extname(file.originalname).toLowerCase();
+    
+    if (allowedTypes.includes(file.mimetype) || allowedExtensions.includes(fileExtension)) {
+      cb(null, true);
+    } else {
+      console.log('Rejected file:', file.originalname, 'Mimetype:', file.mimetype, 'Extension:', fileExtension);
+      cb(new Error('Invalid file type. Allowed types: images, audio, video, .cur files'));
+    }
+  },
+  onError: (err, next) => {
+    console.error('Multer error:', err);
+    next(err);
+  }
+});
+
+// MySQL pool
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  connectionLimit: 10
+});
+
+// Test DB connection
+pool.getConnection()
+  .then(conn => {
+    console.log("✅ Database connected");
+    conn.release();
+  })
+  .catch(err => {
+    console.error("❌ Database connection failed:", err.message);
+  });
+  function getAssetFiles() {
+    const distPath = path.join(path.dirname(new URL(import.meta.url).pathname), "../dist/assets");
+    try {
+      const files = readdirSync(distPath);
+      const js = files.find(f => f.startsWith('index-') && f.endsWith('.js'));
+      const css = files.find(f => f.startsWith('index-') && f.endsWith('.css'));
+      return { js: js || '', css: css || '' };
+    } catch {
+      return { js: '', css: '' };
+    }
+  }
+  
+function authenticate(req, res, next) {
+  const auth = req.headers.authorization?.split(" ")[1];
+  if (!auth) return res.status(401).end();
+
+  try {
+    req.user = jwt.verify(auth, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).end();
+  }
+}
+
+/* =========================
+   AUTH
+========================= */
+
+app.post("/api/auth/register", async (req, res) => {
+
+  try {
+
+    const { username, email, password } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+
+      const [userResult] = await connection.execute(
+        "INSERT INTO users (username,email,password) VALUES (?,?,?)",
+        [username, email, hashedPassword]
+      );
+
+      const userId = userResult.insertId;
+
+      const [profileResult] = await connection.execute(
+        "INSERT INTO profiles (user_id, username, display_name, email) VALUES (?,?,?,?)",
+        [userId, username, username, email]
+      );
+
+      const profileId = profileResult.insertId;
+      
+      // Also create empty profile customization
+      await connection.execute(
+        "INSERT INTO profile_customization (user_id) VALUES (?)",
+        [userId]
+      );
+
+      await connection.commit();
+
+      const token = jwt.sign(
+        { sub: userId.toString(), email },
+        process.env.JWT_SECRET,
+        { expiresIn: "7d" }
+      );
+
+      res.json({ token });
+
+    } catch (error) {
+
+      await connection.rollback();
+
+      if (error.code === "ER_DUP_ENTRY") {
+        return res.status(400).json({ error: "User already exists" });
+      }
+
+      throw error;
+
+    } finally {
+      connection.release();
+    }
+
+  } catch (error) {
+    console.error("Register error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+
+app.post("/api/auth/login", async (req, res) => {
+
+  try {
+
+    const { email, password } = req.body;
+    console.log("Login attempt:", { email, password: password ? '***' : 'undefined' });
+
+    const [rows] = await pool.execute(
+      "SELECT * FROM users WHERE email=?",
+      [email]
+    );
+
+    const user = rows[0];
+    console.log("User found:", user ? 'yes' : 'no');
+
+    if (!user) {
+      console.log("User not found");
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    // Compare hashed password
+    console.log("Comparing password...");
+    const isValidPassword = await bcrypt.compare(password, user.password);
+    console.log("Password valid:", isValidPassword);
+    
+    if (!isValidPassword) {
+      console.log("Invalid password");
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    console.log("Creating token...");
+    const token = jwt.sign(
+      { sub: user.id.toString(), email },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    console.log("Login successful");
+    res.json({ token });
+
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+app.post("/api/auth/change-password", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { currentPassword, newPassword } = req.body;
+    
+    console.log("Change password request for user:", userId);
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: "Current password and new password are required" });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: "New password must be at least 6 characters long" });
+    }
+
+    // Get current user password
+    const [userRows] = await pool.execute(
+      "SELECT password FROM users WHERE id=?",
+      [userId]
+    );
+
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Verify current password
+    const isValidPassword = await bcrypt.compare(currentPassword, userRows[0].password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: "Current password is incorrect" });
+    }
+
+    // Hash new password
+    const hashedNewPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update password
+    await pool.execute(
+      "UPDATE users SET password = ? WHERE id = ?",
+      [hashedNewPassword, userId]
+    );
+
+    console.log("Password changed successfully for user:", userId);
+    res.json({ success: true, message: "Password changed successfully" });
+
+  } catch (error) {
+    console.error("Change password error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================
+   MFA (TOTP) AUTHENTICATION
+========================= */
+
+// Generate MFA secret and QR code
+app.post('/api/auth/mfa/setup', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    console.log("MFA setup request for user:", userId);
+    
+    // Check if user_mfa table exists
+    try {
+      await pool.execute('SELECT 1 FROM user_mfa LIMIT 1');
+      console.log("user_mfa table exists");
+    } catch (error) {
+      console.error("user_mfa table doesn't exist:", error.message);
+      return res.status(500).json({ error: "MFA table not found. Please run the SQL migration first." });
+    }
+    
+    // Get user email for TOTP label
+    const [userRows] = await pool.execute(
+      'SELECT email FROM users WHERE id = ?',
+      [userId]
+    );
+    
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = userRows[0];
+    const secret = totp.generateSecret();
+    const issuer = 'Glowzy.lol'; // Your app name
+    const label = user.email;
+    
+    console.log("Generated MFA secret for:", label);
+    
+    // Generate OTP auth URL
+    const otpauthUrl = totp.toURI({
+  label,
+  issuer,
+  secret
+});
+    
+    // Generate QR code
+    const qrCodeDataURL = await QRCode.toDataURL(otpauthUrl);
+    
+    console.log("QR code generated successfully");
+    
+    // Store secret (not enabled yet)
+    await pool.execute(
+      'INSERT INTO user_mfa (user_id, secret_key) VALUES (?, ?) ON DUPLICATE KEY UPDATE secret_key = ?, enabled = FALSE',
+      [userId, secret, secret]
+    );
+    
+    console.log("MFA secret stored in database");
+    
+    res.json({
+      secret,
+      qrCode: qrCodeDataURL,
+      manualEntryKey: secret
+    });
+    
+  } catch (error) {
+    console.error('MFA setup error:', error);
+    res.status(500).json({ error: 'Internal server error: ' + error.message });
+  }
+});
+
+// Verify and enable MFA
+app.post('/api/auth/mfa/verify-and-enable', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { token } = req.body;
+    
+    if (!token || token.length !== 6) {
+      return res.status(400).json({ error: 'Valid 6-digit token required' });
+    }
+    
+    // Get user's MFA secret
+    const [mfaRows] = await pool.execute(
+      'SELECT secret_key FROM user_mfa WHERE user_id = ?',
+      [userId]
+    );
+    
+    if (mfaRows.length === 0) {
+      return res.status(404).json({ error: 'MFA not set up' });
+    }
+    
+    const secret = mfaRows[0].secret_key;
+    
+    // Verify token
+    const result = await totp.verify(token, {
+  secret,
+  crypto: new NobleCryptoPlugin(),
+  base32: new ScureBase32Plugin()
+});
+
+if (!result.valid) {
+      return res.status(400).json({ error: 'Invalid token' });
+    }
+    
+    // Enable MFA for user
+    await pool.execute(
+      'UPDATE user_mfa SET enabled = TRUE WHERE user_id = ?',
+      [userId]
+    );
+    
+    // Generate backup codes
+    const backupCodes = Array.from({ length: 10 }, () => 
+      crypto.randomBytes(4).toString('hex').toUpperCase()
+    );
+    
+    await pool.execute(
+      'UPDATE user_mfa SET backup_codes = ? WHERE user_id = ?',
+      [JSON.stringify(backupCodes), userId]
+    );
+    
+    res.json({
+      success: true,
+      message: 'MFA enabled successfully',
+      backupCodes
+    });
+    
+  } catch (error) {
+    console.error('MFA verify error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Disable MFA
+app.post('/api/auth/mfa/disable', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { password } = req.body;
+    
+    if (!password) {
+      return res.status(400).json({ error: 'Password required to disable MFA' });
+    }
+    
+    // Verify password
+    const [userRows] = await pool.execute(
+      'SELECT password FROM users WHERE id = ?',
+      [userId]
+    );
+    
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const isValidPassword = await bcrypt.compare(password, userRows[0].password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid password' });
+    }
+    
+    // Disable MFA
+    await pool.execute(
+      'UPDATE user_mfa SET enabled = FALSE WHERE user_id = ?',
+      [userId]
+    );
+    
+    res.json({
+      success: true,
+      message: 'MFA disabled successfully'
+    });
+    
+  } catch (error) {
+    console.error('MFA disable error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get MFA status
+app.get('/api/auth/mfa/status', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    const [mfaRows] = await pool.execute(
+      'SELECT enabled, created_at FROM user_mfa WHERE user_id = ?',
+      [userId]
+    );
+    
+    const mfaEnabled = mfaRows.length > 0 && mfaRows[0].enabled;
+    
+    res.json({
+      enabled: mfaEnabled,
+      setup: mfaRows.length > 0
+    });
+    
+  } catch (error) {
+    console.error('MFA status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Quick MFA table setup (for development) - REMOVED ADMIN CHECK FOR TESTING
+app.post('/api/auth/mfa/setup-tables', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    console.log("MFA table setup request from user:", userId);
+    
+    // Create user_mfa table
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS user_mfa (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL UNIQUE,
+        secret_key VARCHAR(32) NOT NULL,
+        backup_codes JSON,
+        enabled BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    
+    // Create mfa_sessions table
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS mfa_sessions (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id INT NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    
+    console.log("MFA tables created successfully");
+    res.json({ 
+      success: true, 
+      message: "MFA tables created successfully",
+      userId: userId
+    });
+    
+  } catch (error) {
+    console.error('MFA table creation error:', error);
+    res.status(500).json({ 
+      error: 'Failed to create MFA tables: ' + error.message 
+    });
+  }
+});
+
+/* =========================
+   PROFILES
+========================= */
+
+app.get("/api/profiles/me", authenticate, async (req, res) => {
+
+  try {
+
+    const userId = req.user.sub;
+
+    const [rows] = await pool.execute(
+      "SELECT * FROM profiles WHERE user_id=?",
+      [userId]
+    );
+
+    res.json(rows[0] || null);
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+
+app.get("/api/profiles/:username", async (req, res) => {
+
+  try {
+
+    const { username } = req.params;
+    console.log("Searching for profile with username:", username);
+
+    const [rows] = await pool.execute(
+      "SELECT * FROM profiles WHERE username=?",
+      [username]
+    );
+
+    console.log("Found profiles:", rows.length);
+
+    if (rows.length === 0) {
+      // Check what usernames do exist
+      const [allProfiles] = await pool.execute("SELECT username, user_id FROM profiles LIMIT 10");
+      console.log("Available usernames:", allProfiles.map(p => ({ username: p.username, user_id: p.user_id })));
+      return res.status(404).json({ error: "Profile not found" });
+    }
+
+    console.log("Returning profile:", rows[0]);
+    res.json(rows[0]);
+
+  } catch (error) {
+    console.error("Profile fetch error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+app.put("/api/profiles/me", authenticate, async (req, res) => {
+
+  try {
+
+    const userId = req.user.sub;
+
+    const { username, display_name, description, avatar_url, location } = req.body;
+
+    // Convert undefined to null for SQL
+    const safeUsername = username ?? null;
+    const safeDisplayName = display_name ?? null;
+    const safeDescription = description ?? null;
+    const safeAvatarUrl = avatar_url ?? null;
+
+    const [existing] = await pool.execute(
+      "SELECT * FROM profiles WHERE user_id=?",
+      [userId]
+    );
+
+    if (existing.length === 0) {
+
+      await pool.execute(
+        "INSERT INTO profiles (user_id,username,display_name,description,avatar_url) VALUES (?,?,?,?,?)",
+        [userId, safeUsername, safeDisplayName, safeDescription, safeAvatarUrl]
+      );
+
+    } else {
+
+      // Build dynamic UPDATE query - only update fields that are provided
+      const updates = [];
+      const values = [];
+      
+      if (username !== undefined) {
+        updates.push("username=?");
+        values.push(username);
+      }
+      if (display_name !== undefined) {
+        updates.push("display_name=?");
+        values.push(display_name);
+      }
+      if (description !== undefined) {
+        updates.push("description=?");
+        values.push(description);
+      }
+        if (avatar_url !== undefined) {
+        updates.push("avatar_url=?");
+        values.push(avatar_url);
+      }
+      if (location !== undefined) {
+        updates.push("location=?");
+        values.push(location);
+      }
+      
+      if (updates.length > 0) {
+        const updateQuery = `UPDATE profiles SET ${updates.join(',')} WHERE user_id=?`;
+        values.push(userId);
+        await pool.execute(updateQuery, values);
+      }
+
+    }
+
+    res.sendStatus(204);
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+
+/* =========================
+   AUDIO UPLOADS (Non-premium)
+========================= */
+
+app.post("/api/audio-upload", authenticate, upload.single("file"), async (req, res) => {
+  try {
+    console.log("Audio upload request received");
+    
+    if (!req.file) {
+      console.log("No file in request");
+      return res.status(400).json({ error: "No file provided" });
+    }
+
+    // Check if file is audio
+    const audioTypes = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg'];
+    const audioExtensions = ['.mp3', '.wav', '.ogg'];
+    const fileExtension = path.extname(req.file.originalname).toLowerCase();
+    
+    if (!audioTypes.includes(req.file.mimetype) && !audioExtensions.includes(fileExtension)) {
+      return res.status(400).json({ error: "Only audio files are allowed" });
+    }
+
+    const file = req.file;
+    const userId = req.user.sub;
+    
+    console.log("Audio file details:", {
+      originalname: file.originalname,
+      filename: file.filename,
+      mimetype: file.mimetype,
+      size: file.size,
+      path: file.path
+    });
+
+    // Generate a unique URL for audio files
+    const audioUrl = `/audio/${file.filename}`;
+
+    console.log("Audio file saved with URL:", audioUrl);
+
+    res.json({
+      publicUrl: audioUrl,
+      filename: file.filename,
+      originalName: file.originalname,
+      mimetype: file.mimetype,
+      storagePath: file.path
+    });
+
+  } catch (error) {
+    console.error("Audio upload error:", error);
+    
+    // If file was uploaded but processing failed, clean up the file
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log("Cleaned up audio file after error:", req.file.path);
+      } catch (cleanupError) {
+        console.error("Failed to clean up audio file:", cleanupError);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: "Audio upload failed", 
+      details: error.message 
+    });
+  }
+});
+
+/* =========================
+   BACKGROUND UPLOADS (Non-premium)
+========================= */
+
+app.post("/api/background-upload", authenticate, upload.single("file"), async (req, res) => {
+  try {
+    console.log("Background upload request received");
+    
+    if (!req.file) {
+      console.log("No file in request");
+      return res.status(400).json({ error: "No file provided" });
+    }
+
+    // Check if file is an image
+    const imageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+    const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+    const fileExtension = path.extname(req.file.originalname).toLowerCase();
+    
+    if (!imageTypes.includes(req.file.mimetype) && !imageExtensions.includes(fileExtension)) {
+      return res.status(400).json({ error: "Only image files are allowed" });
+    }
+
+    const file = req.file;
+    const userId = req.user.sub;
+    
+    console.log("Background image details:", {
+      originalname: file.originalname,
+      filename: file.filename,
+      mimetype: file.mimetype,
+      size: file.size,
+      path: file.path
+    });
+
+    // Generate a unique URL for background images
+    const backgroundUrl = `/backgrounds/${file.filename}`;
+
+    console.log("Background image saved with URL:", backgroundUrl);
+
+    res.json({
+      publicUrl: backgroundUrl,
+      filename: file.filename,
+      originalName: file.originalname,
+      mimetype: file.mimetype,
+      storagePath: file.path
+    });
+
+  } catch (error) {
+    console.error("Background upload error:", error);
+    
+    // If file was uploaded but processing failed, clean up the file
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log("Cleaned up background file after error:", req.file.path);
+      } catch (cleanupError) {
+        console.error("Failed to clean up background file:", cleanupError);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: "Background upload failed", 
+      details: error.message 
+    });
+  }
+});
+
+/* =========================
+   PROFILE IMAGE UPLOADS (Non-premium)
+========================= */
+
+app.post("/api/profile-image-upload", authenticate, upload.single("file"), async (req, res) => {
+  try {
+    console.log("Profile image upload request received");
+    
+    if (!req.file) {
+      console.log("No file in request");
+      return res.status(400).json({ error: "No file provided" });
+    }
+
+    // Check if file is an image
+    const imageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+    const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+    const fileExtension = path.extname(req.file.originalname).toLowerCase();
+    
+    if (!imageTypes.includes(req.file.mimetype) && !imageExtensions.includes(fileExtension)) {
+      return res.status(400).json({ error: "Only image files are allowed" });
+    }
+
+    const file = req.file;
+    const userId = req.user.sub;
+    
+    console.log("Profile image details:", {
+      originalname: file.originalname,
+      filename: file.filename,
+      mimetype: file.mimetype,
+      size: file.size,
+      path: file.path
+    });
+
+    // Generate a unique URL for profile images
+    const profileImageUrl = `/profile-images/${file.filename}`;
+
+    console.log("Profile image saved with URL:", profileImageUrl);
+
+    res.json({
+      publicUrl: profileImageUrl,
+      filename: file.filename,
+      originalName: file.originalname,
+      mimetype: file.mimetype,
+      storagePath: file.path
+    });
+
+  } catch (error) {
+    console.error("Profile image upload error:", error);
+    
+    // If file was uploaded but processing failed, clean up the file
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log("Cleaned up profile image file after error:", req.file.path);
+      } catch (cleanupError) {
+        console.error("Failed to clean up profile image file:", cleanupError);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: "Profile image upload failed", 
+      details: error.message 
+    });
+  }
+});
+// Publieke avatar voor SEO/Discord embeds (geen token nodig)
+app.get("/api/public-avatar/:username", async (req, res) => {
+  try {
+    const { username } = req.params;
+
+    const [rows] = await pool.execute(
+      "SELECT avatar_url FROM profiles WHERE username = ?",
+      [username]
+    );
+
+    if (rows.length === 0 || !rows[0].avatar_url) {
+      return res.redirect("https://glowzy.lol/default-avatar.png");
+    }
+
+    // avatar_url ziet eruit als: /profile-images/729b2a31c34b5f69...
+    const filename = rows[0].avatar_url.replace("/profile-images/", "");
+    const filePath = path.join(process.cwd(), "data", "uploads", filename);
+
+    if (!fs.existsSync(filePath)) {
+      return res.redirect("https://glowzy.lol/default-avatar.png");
+    }
+
+    res.sendFile(filePath);
+
+  } catch (error) {
+    console.error("Public avatar error:", error);
+    res.status(500).end();
+  }
+});
+
+/* =========================
+   UPLOADS (Premium Only)
+========================= */
+
+app.get('/api/uploads', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Check if user has premium
+    const [profileRows] = await pool.execute('SELECT is_premium FROM profiles WHERE user_id = ?', [userId]);
+    if (profileRows.length === 0 || !profileRows[0].is_premium) {
+      return res.status(403).json({ error: 'Premium subscription required for image hosting' });
+    }
+    
+    // Check if table exists, if not create it
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS uploaded_files (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        file_name VARCHAR(255) NOT NULL,
+        original_name VARCHAR(255) NOT NULL,
+        file_size INT NOT NULL,
+        mime_type VARCHAR(100) NOT NULL,
+        storage_path TEXT NOT NULL,
+        public_url TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    
+    const [rows] = await pool.execute('SELECT * FROM uploaded_files WHERE user_id = ? ORDER BY created_at DESC', [userId]);
+    res.json(rows);
+  } catch (error) {
+    console.error("Uploads error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/uploads", authenticate, upload.single("file"), async (req, res) => {
+
+  try {
+    
+    console.log("Upload request received");
+    
+    if (!req.file) {
+      console.log("No file in request");
+      return res.status(400).json({ error: "No file provided" });
+    }
+
+    const file = req.file;
+    const userId = req.user.sub;
+    
+    // Check if user has premium
+    const [profileRows] = await pool.execute('SELECT is_premium FROM profiles WHERE user_id = ?', [userId]);
+    if (profileRows.length === 0 || !profileRows[0].is_premium) {
+      return res.status(403).json({ error: 'Premium subscription required for image hosting' });
+    }
+    
+    console.log("File details:", {
+      originalname: file.originalname,
+      filename: file.filename,
+      mimetype: file.mimetype,
+      size: file.size,
+      path: file.path
+    });
+
+    const [result] = await pool.execute(
+      "INSERT INTO uploaded_files (user_id,file_name,original_name,file_size,mime_type,storage_path,public_url) VALUES (?,?,?,?,?,?,?)",
+      [
+        userId,
+        file.filename,
+        file.originalname,
+        file.size,
+        file.mimetype,
+        file.path,
+        `/uploads/${file.filename}`
+      ]
+    );
+
+    console.log("File saved to database with ID:", result.insertId);
+
+    res.json({
+      id: result.insertId,
+      publicUrl: `/uploads/${file.filename}`,
+      filename: file.filename,
+      originalName: file.originalname,
+      mimetype: file.mimetype,
+      storagePath: file.path
+    });
+
+  } catch (error) {
+    console.error("Upload error:", error);
+    
+    // If file was uploaded but database insert failed, clean up the file
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log("Cleaned up file after database error:", req.file.path);
+      } catch (cleanupError) {
+        console.error("Failed to clean up file:", cleanupError);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: "Upload failed", 
+      details: error.message 
+    });
+  }
+
+});
+
+app.delete('/api/uploads/:id', authenticate, async (req, res) => {
+  try {
+    const fileId = req.params.id;
+    const userId = req.user.sub;
+    
+    // Check if file belongs to this user
+    const [rows] = await pool.execute('SELECT storage_path FROM uploaded_files WHERE id = ? AND user_id = ?', [fileId, userId]);
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'File not found or access denied' });
+    }
+    
+    const file = rows[0];
+    if (file) {
+      fs.unlinkSync(file.storage_path);
+    }
+    
+    await pool.execute('DELETE FROM uploaded_files WHERE id = ? AND user_id = ?', [fileId, userId]);
+    res.sendStatus(204);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete file" });
+  }
+});
+
+/* =========================
+   PROTECTED FILE SERVING
+========================= */
+
+// Serve audio files (non-premium)
+app.get('/audio/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const { token } = req.query;
+    
+    // Verify JWT token from URL
+    let userId;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.sub;
+      } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+    } else {
+      // Try to get token from Authorization header as fallback
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const decoded = jwt.verify(authHeader.substring(7), process.env.JWT_SECRET);
+          userId = decoded.sub;
+        } catch (error) {
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+      } else {
+        return res.status(401).json({ error: 'Authorization required' });
+      }
+    }
+    
+    // Construct the file path (audio files are stored in the general uploads directory)
+    const filePath = path.join(uploadDir, filename);
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+    
+    // Serve the file
+    res.sendFile(path.resolve(filePath));
+    
+  } catch (error) {
+    console.error('Audio file serving error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Serve profile image files (non-premium)
+app.get('/profile-images/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    
+    // Construct the file path (profile images are stored in the general uploads directory)
+    const filePath = path.join(uploadDir, filename);
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+    
+    // Serve the file
+    res.sendFile(path.resolve(filePath));
+    
+  } catch (error) {
+    console.error('Profile image serving error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Serve background image files (non-premium)
+app.get('/backgrounds/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const { token } = req.query;
+    
+    // Verify JWT token from URL
+    let userId;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.sub;
+      } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+    } else {
+      // Try to get token from Authorization header as fallback
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const decoded = jwt.verify(authHeader.substring(7), process.env.JWT_SECRET);
+          userId = decoded.sub;
+        } catch (error) {
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+      } else {
+        return res.status(401).json({ error: 'Authorization required' });
+      }
+    }
+    
+    // Construct the file path (background images are stored in the general uploads directory)
+    const filePath = path.join(uploadDir, filename);
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+    
+    // Serve the file
+    res.sendFile(path.resolve(filePath));
+    
+  } catch (error) {
+    console.error('Background image serving error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Serve premium uploaded files
+app.get('/uploads/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const { token } = req.query;
+    
+    // Verify JWT token from URL
+    let userId;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.sub;
+      } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+    } else {
+      // Try to get token from Authorization header as fallback
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const decoded = jwt.verify(authHeader.substring(7), process.env.JWT_SECRET);
+          userId = decoded.sub;
+        } catch (error) {
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+      } else {
+        return res.status(401).json({ error: 'Authorization required' });
+      }
+    }
+    
+    // Check if file belongs to this user
+    const [rows] = await pool.execute(
+      'SELECT storage_path FROM uploaded_files WHERE user_id = ? AND file_name = ?',
+      [userId, filename]
+    );
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    
+    const filePath = rows[0].storage_path;
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+    
+    // Serve the file
+    res.sendFile(path.resolve(filePath));
+    
+  } catch (error) {
+    console.error('File serving error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   SOCIAL LINKS
+========================= */
+
+app.get('/api/social-links', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) {
+      return res.status(400).json({ error: 'userId required' });
+    }
+    const [rows] = await pool.execute('SELECT * FROM social_links WHERE user_id = ? ORDER BY display_order', [userId]);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post("/api/social-links", authenticate, async (req, res) => {
+
+  try {
+
+    const userId = req.user.sub;
+
+    const { platform, url, display_order } = req.body;
+
+    const [result] = await pool.execute(
+      "INSERT INTO social_links (user_id,platform,url,display_order) VALUES (?,?,?,?)",
+      [userId, platform, url, display_order || 0]
+    );
+
+    res.json({
+      id: result.insertId,
+      platform,
+      url,
+      display_order
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+app.put('/api/social-links/:id', authenticate, async (req, res) => {
+  try {
+    const linkId = req.params.id;
+    const { url, display_order } = req.body;
+    await pool.execute('UPDATE social_links SET url = ?, display_order = ? WHERE id = ?', [url, display_order || 0, linkId]);
+    res.sendStatus(204);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/social-links/:id', authenticate, async (req, res) => {
+  try {
+    const linkId = req.params.id;
+    await pool.execute('DELETE FROM social_links WHERE id = ?', [linkId]);
+    res.sendStatus(204);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   BADGES
+========================= */
+
+app.get('/api/badges', async (req, res) => {
+  const [rows] = await pool.execute('SELECT * FROM badges ORDER BY name');
+  res.json(rows);
+});
+
+app.get('/api/user-badges', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const [rows] = await pool.execute(`
+      SELECT ub.*, b.name, b.description, b.icon, b.color, b.is_premium 
+      FROM user_badges ub 
+      JOIN badges b ON ub.badge_id = b.id 
+      WHERE ub.user_id = ? AND ub.enabled = true
+    `, [userId]);
+    res.json(rows);
+  } catch (error) {
+    console.error('Get user badges error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/user-badges', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { badgeId } = req.body;
+    if (!badgeId) return res.status(400).json({ error: 'badgeId required' });
+    
+    // Get badge info to check if it's premium
+    const [badgeInfo] = await pool.execute('SELECT * FROM badges WHERE id = ?', [badgeId]);
+    if (badgeInfo.length === 0) {
+      return res.status(404).json({ error: 'Badge not found' });
+    }
+    
+    const badge = badgeInfo[0];
+    
+    // Check if badge is premium and user has premium
+    if (badge.is_premium) {
+      const [profile] = await pool.execute('SELECT is_premium FROM profiles WHERE user_id = ?', [userId]);
+      if (profile.length === 0 || !profile[0].is_premium) {
+        return res.status(403).json({ error: 'Premium badge requires premium subscription' });
+      }
+    }
+    
+    // Check if user already has this badge
+    const [existing] = await pool.execute(
+      'SELECT * FROM user_badges WHERE user_id = ? AND badge_id = ?',
+      [userId, badgeId]
+    );
+    
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Badge already owned' });
+    }
+    
+    await pool.execute(
+      'INSERT INTO user_badges (user_id, badge_id, enabled) VALUES (?,?,?)',
+      [userId, badgeId, true]
+    );
+    
+    res.status(201).end();
+  } catch (error) {
+    console.error('Add user badge error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/user-badges/:id', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const badgeId = req.params.id;
+    await pool.execute('DELETE FROM user_badges WHERE user_id = ? AND badge_id = ?', [userId, badgeId]);
+    res.sendStatus(204);
+  } catch (error) {
+    console.error("Delete user badge error:", error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   ANALYTICS
+========================= */
+
+app.get('/api/analytics/views', authenticate, async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const [rows] = await pool.execute('SELECT * FROM profile_views WHERE profile_user_id = ? ORDER BY created_at DESC', [userId]);
+  res.json(rows);
+});
+
+app.post('/api/profile-views', async (req, res) => {
+  try {
+    const { profile_user_id, viewer_ip, user_agent, referrer, device_type } = req.body;
+    
+    await pool.execute(
+      'INSERT INTO profile_views (profile_user_id, viewer_ip, user_agent, referrer, device_type) VALUES (?,?,?,?,?)',
+      [profile_user_id, viewer_ip || req.ip, user_agent || req.get('User-Agent'), referrer || null, device_type || 'desktop']
+    );
+    
+    res.status(201).json({ success: true, message: 'Profile view recorded successfully' });
+  } catch (error) {
+    console.error('Profile views error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   PROFILE CUSTOMIZATION
+========================= */
+
+app.get("/api/profile-customization/:userId", authenticate, async (req, res) => {
+
+  try {
+
+    const { userId } = req.params;
+
+    if (req.user.sub !== userId) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const [rows] = await pool.execute(
+      "SELECT * FROM profile_customization WHERE user_id=?",
+      [userId]
+    );
+
+    res.json(rows[0] || null);
+
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+
+});
+
+
+app.put("/api/profile-customization/:userId", authenticate, async (req, res) => {
+
+  try {
+
+    const { userId } = req.params;
+
+    if (req.user.sub !== userId) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const customization = req.body;
+
+    const [existing] = await pool.execute(
+      "SELECT * FROM profile_customization WHERE user_id=?",
+      [userId]
+    );
+
+    if (existing.length === 0) {
+
+      await pool.execute(
+        "INSERT INTO profile_customization (user_id) VALUES (?)",
+        [userId]
+      );
+
+    } else {
+
+      const setClause = Object.keys(customization).map(key => `${key} = ?`).join(', ');
+      
+      const values = Object.keys(customization).map(key => {
+        const value = customization[key];
+        if (key === 'audio_files' && Array.isArray(value)) {
+          return JSON.stringify(value);
+        }
+        return value;
+      });
+      
+      if (setClause.length === 0) {
+        res.sendStatus(204);
+        return;
+      }
+      
+      const allValues = [...values, userId];
+      
+      await pool.execute(`UPDATE profile_customization SET ${setClause} WHERE user_id = ?`, 
+        allValues);
+    }
+
+    res.sendStatus(204);
+
+  } catch (error) {
+    console.error("Profile customization PUT error:", error);
+    res.status(500).json({ 
+      error: "Internal server error",
+      details: error.message,
+      sqlError: error.sqlMessage 
+    });
+  }
+
+});
+
+/* =========================
+   PUBLIC ENDPOINTS
+========================= */
+
+app.get('/api/public/profile-customization/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const [rows] = await pool.execute(
+      'SELECT * FROM profile_customization WHERE user_id = ?',
+      [userId]
+    );
+    res.json(rows[0] || {});
+  } catch (error) {
+    console.error('Public profile customization error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/public/user-badges/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const [rows] = await pool.execute(`
+      SELECT ub.*, b.name, b.description, b.icon, b.color, b.is_premium 
+      FROM user_badges ub 
+      JOIN badges b ON ub.badge_id = b.id 
+      WHERE ub.user_id = ? AND ub.enabled = true
+    `, [userId]);
+    res.json(rows);
+  } catch (error) {
+    console.error('Public user badges error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   BADGE VERIFICATION
+========================= */
+
+app.post('/api/request-badge', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { badgeId } = req.body;
+    
+    const [badgeRows] = await pool.execute(
+      'SELECT * FROM badges WHERE id = ?',
+      [badgeId]
+    );
+    const badge = badgeRows[0];
+    
+    if (!badge) {
+      return res.status(404).json({ error: 'Badge not found' });
+    }
+    
+    if (badge?.badge_type === 'developer') {
+      if (req.user.sub !== '1') {
+        return res.status(403).json({ error: 'Only owner can request this badge' });
+      }
+    }
+    
+    if (badge?.badge_type === 'early_supporter') {
+      const [userRows] = await pool.execute(
+        'SELECT email_verified FROM users WHERE id = ?',
+        [userId]
+      );
+      const user = userRows[0];
+      
+      if (!user.email_verified) {
+        return res.status(403).json({ error: 'Email verification required for this badge' });
+      }
+    }
+    
+    if (badge.badge_type === 'free' || (!badge.badge_type && !badge.is_premium)) {
+      return res.json({ 
+        success: true, 
+        message: 'Free badge activated',
+        requiresVerification: false 
+      });
+    }
+    
+    const [existingRequest] = await pool.execute(
+      'SELECT * FROM badge_verification_requests WHERE user_id = ? AND badge_id = ?',
+      [userId, badgeId]
+    );
+    
+    if (existingRequest.length > 0) {
+      return res.json({ 
+        success: false, 
+        message: 'Badge already requested',
+        status: existingRequest[0].status 
+      });
+    }
+    
+    await pool.execute(
+      'INSERT INTO badge_verification_requests (user_id, badge_id, status) VALUES (?, ?, ?)',
+      [userId, badgeId, 'pending']
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Badge verification request submitted',
+      requiresVerification: true,
+      status: 'pending'
+    });
+    
+  } catch (error) {
+    console.error('Request badge error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/approve-badge', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    if (userId !== '1') {
+      return res.status(403).json({ error: 'Only owner can approve badges' });
+    }
+    
+    const { requestId, userId: targetUserId, badgeId } = req.body;
+    
+    await pool.execute(
+      'UPDATE badge_verification_requests SET status = ?, approved_by = ?, approved_at = NOW() WHERE id = ?',
+      ['approved', userId, requestId]
+    );
+    
+    await pool.execute(
+      'INSERT INTO user_badges (user_id, badge_id, enabled) VALUES (?, ?, ?)',
+      [targetUserId, badgeId, true]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Badge approved and activated' 
+    });
+    
+  } catch (error) {
+    console.error('Approve badge error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/verification-requests', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    if (userId !== '1') {
+      return res.status(403).json({ error: 'Only owner can view verification requests' });
+    }
+    
+    const [rows] = await pool.execute(`
+      SELECT vr.*, u.username, u.email, b.name as badge_name, b.badge_type
+      FROM badge_verification_requests vr
+      JOIN users u ON vr.user_id = u.id
+      JOIN badges b ON vr.badge_id = b.id
+      ORDER BY vr.created_at DESC
+    `);
+    
+    res.json(rows);
+    
+  } catch (error) {
+    console.error('List verification requests error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   ADMIN / ROLES
+========================= */
+
+app.post('/api/add-admin', authenticate, async (req, res) => {
+  try {
+    const requesterId = req.user.sub;
+    if (requesterId !== '1') {
+      return res.status(403).json({ error: 'Only owner can add admin roles' });
+    }
+    
+    const { userId } = req.body;
+    
+    await pool.execute(
+      'INSERT INTO user_roles (user_id, role) VALUES (?, ?)',
+      [userId, 'admin']
+    );
+    
+    res.json({ success: true, message: 'Admin role added' });
+  } catch (error) {
+    console.error('Add admin error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/remove-admin', authenticate, async (req, res) => {
+  try {
+    const requesterId = req.user.sub;
+    if (requesterId !== '1') {
+      return res.status(403).json({ error: 'Only owner can remove admin roles' });
+    }
+    
+    const { userId } = req.body;
+    
+    await pool.execute(
+      'DELETE FROM user_roles WHERE user_id = ? AND role = ?',
+      [userId, 'admin']
+    );
+    
+    res.json({ success: true, message: 'Admin role removed' });
+  } catch (error) {
+    console.error('Remove admin error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/admins', authenticate, async (req, res) => {
+  try {
+    const requesterId = req.user.sub;
+    if (requesterId !== '1') {
+      return res.status(403).json({ error: 'Only owner can view admins' });
+    }
+    
+    const [rows] = await pool.execute(`
+      SELECT u.id, u.username, u.email, ur.created_at as admin_since
+      FROM users u
+      JOIN user_roles ur ON u.id = ur.user_id
+      WHERE ur.role = 'admin'
+      ORDER BY ur.created_at DESC
+    `);
+    
+    res.json(rows);
+  } catch (error) {
+    console.error('List admins error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/check-owner', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const isOwner = userId === '1';
+    res.json({ isOwner });
+  } catch (error) {
+    console.error('Check owner error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   DB SETUP HELPERS
+========================= */
+
+app.post('/api/create-user-roles-table', async (req, res) => {
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS user_roles (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        role ENUM('admin', 'moderator') NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE KEY unique_user_role (user_id, role)
+      )
+    `);
+    
+    res.json({ success: true, message: 'User roles table created' });
+  } catch (error) {
+    console.error('Create user roles table error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/create-badge-verification-table', async (req, res) => {
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS badge_verification_requests (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        badge_id INT NOT NULL,
+        status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+        requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        approved_by INT NULL,
+        approved_at TIMESTAMP NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (badge_id) REFERENCES badges(id) ON DELETE CASCADE,
+        UNIQUE KEY unique_user_badge (user_id, badge_id)
+      )
+    `);
+    
+    res.json({ success: true, message: 'Badge verification table created' });
+  } catch (error) {
+    console.error('Create badge verification table error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/update-badges-structure', async (req, res) => {
+  try {
+    await pool.execute(`
+      ALTER TABLE badges 
+      ADD COLUMN badge_type ENUM('free', 'premium', 'developer', 'early_supporter') DEFAULT 'free'
+    `);
+    
+    await pool.execute(`
+      ALTER TABLE badges 
+      ADD COLUMN admin_only BOOLEAN DEFAULT FALSE
+    `);
+    
+    await pool.execute(`
+      UPDATE badges SET is_premium = TRUE WHERE id IN (1, 2, 3)
+    `);
+    
+    res.json({ success: true, message: 'Badges table updated with premium badges' });
+  } catch (error) {
+    console.error('Update badges structure error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================
+   DB STATUS
+========================= */
+
+app.get('/api/db-status', async (req, res) => {
+  try {
+    const [tables] = await pool.execute('SHOW TABLES');
+    const [userCount] = await pool.execute('SELECT COUNT(*) as count FROM users');
+    const [profileCount] = await pool.execute('SELECT COUNT(*) as count FROM profiles');
+    
+    res.json({
+      tables: tables.map(t => Object.values(t)[0]),
+      userCount: userCount[0].count,
+      profileCount: profileCount[0].count,
+      status: 'connected'
+    });
+  } catch (error) {
+    console.error('DB status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================
+   TEMPLATES
+========================= */
+
+app.post('/api/create-templates-table', async (req, res) => {
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS templates (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        author_id INT NOT NULL,
+        author_username VARCHAR(100),
+        preview_image VARCHAR(255),
+        category VARCHAR(100),
+        tags JSON,
+        is_premium BOOLEAN DEFAULT FALSE,
+        is_public BOOLEAN DEFAULT TRUE,
+        uses INT DEFAULT 0,
+        downloads INT DEFAULT 0,
+        rating DECIMAL(3,2) DEFAULT 0.00,
+        status ENUM('draft', 'published', 'archived') DEFAULT 'draft',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    
+    res.json({ success: true, message: 'Templates table created' });
+  } catch (error) {
+    console.error('Create templates table error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/templates', async (req, res) => {
+  try {
+    const { category, search, sort = 'created_at', order = 'DESC', limit = 50, offset = 0 } = req.query;
+    
+    let query = `
+      SELECT t.*, u.username as author_username,
+             (SELECT COUNT(*) FROM template_downloads td WHERE td.template_id = t.id) as download_count
+      FROM templates t
+      JOIN users u ON t.author_id = u.id
+      WHERE t.status = 'published' AND t.is_public = true
+    `;
+    
+    const params = [];
+    
+    if (category) {
+      query += ' AND t.category = ?';
+      params.push(category);
+    }
+    
+    if (search) {
+      query += ' AND (t.name LIKE ? OR t.description LIKE ? OR JSON_CONTAINS(t.tags, ?))';
+      const searchParam = `%${search}%`;
+      params.push(searchParam, searchParam, `"${search}"`);
+    }
+    
+    const allowedSorts = ['created_at', 'uses', 'downloads', 'rating', 'name'];
+    const sortField = allowedSorts.includes(sort) ? sort : 'created_at';
+    const sortOrder = order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+    query += ` ORDER BY t.${sortField} ${sortOrder}`;
+    
+const finalLimit = Number(limit);
+const finalOffset = Number(offset);
+const [templates] = await pool.execute(query + ` LIMIT ${finalLimit} OFFSET ${finalOffset}`, params);
+    
+    let countQuery = `
+      SELECT COUNT(*) as total 
+      FROM templates t 
+      WHERE t.status = 'published' AND t.is_public = true
+    `;
+    const countParams = [];
+    
+    if (category) {
+      countQuery += ' AND t.category = ?';
+      countParams.push(category);
+    }
+    
+    if (search) {
+      countQuery += ' AND (t.name LIKE ? OR t.description LIKE ? OR JSON_CONTAINS(t.tags, ?))';
+      const searchParam = `%${search}%`;
+      countParams.push(searchParam, searchParam, `"${search}"`);
+    }
+    
+    const [countResult] = await pool.execute(countQuery, countParams);
+    
+    res.json({
+      templates,
+      total: countResult[0].total,
+      hasMore: (parseInt(offset) + parseInt(limit)) < countResult[0].total
+    });
+  } catch (error) {
+    console.error('Get templates error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   TEMPLATE FAVORITES
+========================= */
+
+// GET /api/templates/favorites — haal favorieten op van ingelogde gebruiker
+app.get('/api/templates/favorites', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const [rows] = await pool.execute(`
+      SELECT t.*, 
+             (SELECT COUNT(*) FROM template_downloads td WHERE td.template_id = t.id) as download_count
+      FROM template_favorites tf
+      JOIN templates t ON tf.template_id = t.id
+      WHERE tf.user_id = ?
+      ORDER BY tf.created_at DESC
+    `, [userId]);
+    res.json(rows);
+  } catch (error) {
+    console.error('Get favorites error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/templates/:id/favorite — voeg toe aan favorieten
+app.post('/api/templates/:id/favorite', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const templateId = req.params.id;
+    await pool.execute(
+      'INSERT IGNORE INTO template_favorites (user_id, template_id) VALUES (?, ?)',
+      [userId, templateId]
+    );
+    res.json({ success: true, favorited: true });
+  } catch (error) {
+    console.error('Add favorite error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/templates/:id/favorite — verwijder uit favorieten
+app.delete('/api/templates/:id/favorite', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const templateId = req.params.id;
+    await pool.execute(
+      'DELETE FROM template_favorites WHERE user_id = ? AND template_id = ?',
+      [userId, templateId]
+    );
+    res.json({ success: true, favorited: false });
+  } catch (error) {
+    console.error('Remove favorite error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/templates/:id', async (req, res) => {
+  try {
+    const templateId = req.params.id;
+    
+    const [templates] = await pool.execute(`
+      SELECT t.*, u.username as author_username,
+             (SELECT COUNT(*) FROM template_downloads td WHERE td.template_id = t.id) as download_count
+      FROM templates t
+      JOIN users u ON t.author_id = u.id
+      WHERE t.id = ? AND t.status = 'published' AND t.is_public = true
+    `, [templateId]);
+    
+    if (templates.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    await pool.execute(
+      'UPDATE templates SET uses = uses + 1 WHERE id = ?',
+      [templateId]
+    );
+    
+    res.json(templates[0]);
+  } catch (error) {
+    console.error('Get template error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/templates', authenticate, upload.single('preview'), async (req, res) => {
+  try {
+    console.log('Template creation request:', req.body);
+    console.log('User:', req.user);
+    
+    const { name, description, category, tags, is_premium = false, is_public = true } = req.body;
+    const authorId = req.user.sub;
+    
+    // Convert string boolean values to actual booleans
+    const isPremiumBool = is_premium === 'true' || is_premium === true;
+    const isPublicBool = is_public === 'true' || is_public === true;
+    
+    console.log('Converted boolean values:', { isPremiumBool, isPublicBool, original_is_premium: is_premium, original_is_public: is_public });
+    
+    if (!name) {
+      return res.status(400).json({ error: 'Name is required' });
+    }
+    
+    // Get username from database
+    const [userRows] = await pool.execute('SELECT username FROM users WHERE id = ?', [authorId]);
+    const authorUsername = userRows[0]?.username || 'unknown';
+    
+    console.log('Author username:', authorUsername);
+    
+    let parsedTags = [];
+    if (tags) {
+      try {
+        parsedTags = typeof tags === 'string' ? JSON.parse(tags) : tags;
+      } catch (error) {
+        parsedTags = tags.split(',').map(tag => tag.trim()).filter(Boolean);
+      }
+    }
+    
+    let previewImage = null;
+    if (req.file) {
+      const ext = path.extname(req.file.originalname).toLowerCase() || '.png';
+      const newFilename = req.file.filename + ext;
+      const oldPath = path.join(uploadDir, req.file.filename);
+      const newPath = path.join(uploadDir, newFilename);
+      fs.renameSync(oldPath, newPath);
+      previewImage = `/uploads/${newFilename}`;
+    }
+    
+    // ============================================
+    // NIEUW: Haal de huidige customization op van de gebruiker
+    // ============================================
+    const [customizationRows] = await pool.execute(
+      'SELECT * FROM profile_customization WHERE user_id = ?',
+      [authorId]
+    );
+
+    // Haal avatar op uit profiles tabel
+    const [profileAvatarRows] = await pool.execute(
+      'SELECT avatar_url FROM profiles WHERE user_id = ?',
+      [authorId]
+    );
+    
+    let config = null;
+    if (customizationRows.length > 0) {
+      const customization = customizationRows[0];
+      
+      // Bouw een config object met alle relevante velden
+      config = {
+        avatar_url: profileAvatarRows[0]?.avatar_url || null,
+        background_color: customization.background_color,
+        text_color: customization.text_color,
+        accent_color: customization.accent_color,
+        primary_color: customization.primary_color,
+        secondary_color: customization.secondary_color,
+        icon_color: customization.icon_color,
+        button_style: customization.button_style,
+        theme: customization.theme,
+        font_family: customization.font_family,
+        border_radius: customization.border_radius,
+        layout: customization.layout,
+        custom_css: customization.custom_css,
+        background_effect: customization.background_effect,
+        username_effect: customization.username_effect,
+        profile_opacity: customization.profile_opacity,
+        profile_blur: customization.profile_blur,
+        monochrome_icons: customization.monochrome_icons,
+        animated_title: customization.animated_title,
+        swap_box_colors: customization.swap_box_colors,
+        disable_profile_gradient: customization.disable_profile_gradient,
+        audio_url: customization.audio_url,
+        custom_cursor_url: customization.custom_cursor_url,
+        background_url: customization.background_url,
+        audio_files: customization.audio_files,
+        audio_shuffle_enabled: customization.audio_shuffle_enabled,
+        show_audio_player: customization.show_audio_player,
+        discord_presence: customization.discord_presence,
+        use_discord_avatar: customization.use_discord_avatar,
+        discord_avatar_decoration: customization.discord_avatar_decoration,
+        glow_username: customization.glow_username,
+        glow_socials: customization.glow_socials,
+        glow_badges: customization.glow_badges
+      };
+      
+      console.log('Generated config from user customization');
+    }
+    
+    console.log('Creating template with:', {
+      name,
+      description,
+      authorId,
+      authorUsername,
+      previewImage,
+      category,
+      parsedTags,
+      is_premium: isPremiumBool,
+      is_public: isPublicBool,
+      hasConfig: !!config
+    });
+    
+    const [result] = await pool.execute(`
+      INSERT INTO templates (name, description, author_id, author_username, preview_image, category, tags, config, is_premium, is_public, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'published')
+    `, [
+      name,
+      description,
+      authorId,
+      authorUsername,
+      previewImage,
+      category,
+      JSON.stringify(parsedTags),
+      JSON.stringify(config),
+      isPremiumBool,
+      isPublicBool
+    ]);
+    
+    console.log('Template inserted with ID:', result.insertId);
+    
+    const [templates] = await pool.execute('SELECT * FROM templates WHERE id = ?', [result.insertId]);
+    
+    console.log('Retrieved template:', templates[0]);
+    
+    res.status(201).json({
+      success: true,
+      template: templates[0],
+      message: 'Template created successfully with customization'
+    });
+  } catch (error) {
+    console.error('Create template error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/my-templates', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    const [templates] = await pool.execute(`
+      SELECT t.*, 
+             (SELECT COUNT(*) FROM template_downloads td WHERE td.template_id = t.id) as download_count
+      FROM templates t
+      WHERE t.author_id = ?
+      ORDER BY t.created_at DESC
+    `, [userId]);
+    
+    res.json(templates);
+  } catch (error) {
+    console.error('Get my templates error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/templates/:id', authenticate, async (req, res) => {
+  try {
+    const templateId = req.params.id;
+    const { name, description, category, tags, is_premium, is_public, status } = req.body;
+    const userId = req.user.sub;
+    
+    const [templates] = await pool.execute(
+      'SELECT author_id FROM templates WHERE id = ?',
+      [templateId]
+    );
+    
+    if (templates.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    if (templates[0].author_id !== userId) {
+      return res.status(403).json({ error: 'You can only edit your own templates' });
+    }
+    
+    let parsedTags = tags;
+    if (tags && typeof tags === 'string') {
+      try {
+        parsedTags = JSON.parse(tags);
+      } catch (error) {
+        parsedTags = tags.split(',').map(tag => tag.trim()).filter(Boolean);
+      }
+    }
+    
+    const updateFields = [];
+    const updateValues = [];
+    
+    if (name !== undefined) { updateFields.push('name = ?'); updateValues.push(name); }
+    if (description !== undefined) { updateFields.push('description = ?'); updateValues.push(description); }
+    if (category !== undefined) { updateFields.push('category = ?'); updateValues.push(category); }
+    if (tags !== undefined) { updateFields.push('tags = ?'); updateValues.push(JSON.stringify(parsedTags)); }
+    if (is_premium !== undefined) { updateFields.push('is_premium = ?'); updateValues.push(is_premium); }
+    if (is_public !== undefined) { updateFields.push('is_public = ?'); updateValues.push(is_public); }
+    if (status !== undefined) { updateFields.push('status = ?'); updateValues.push(status); }
+    
+    if (updateFields.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    updateValues.push(templateId);
+    
+    await pool.execute(
+      `UPDATE templates SET ${updateFields.join(', ')} WHERE id = ?`,
+      updateValues
+    );
+    
+    res.json({ success: true, message: 'Template updated successfully' });
+  } catch (error) {
+    console.error('Update template error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/templates/:id', authenticate, async (req, res) => {
+  try {
+    const templateId = req.params.id;
+    const userId = req.user.sub;
+    
+    const [templates] = await pool.execute(
+      'SELECT author_id FROM templates WHERE id = ?',
+      [templateId]
+    );
+    
+    if (templates.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    if (templates[0].author_id !== userId) {
+      return res.status(403).json({ error: 'You can only delete your own templates' });
+    }
+    
+    await pool.execute('DELETE FROM templates WHERE id = ?', [templateId]);
+    
+    res.json({ success: true, message: 'Template deleted successfully' });
+  } catch (error) {
+    console.error('Delete template error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   PROFILE UTILS
+========================= */
+
+app.post('/api/ensure-profile', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { username, email } = req.body;
+    
+    const [existing] = await pool.execute(
+      'SELECT * FROM profiles WHERE user_id = ?',
+      [userId]
+    );
+    
+    if (existing.length === 0) {
+      const [profileResult] = await pool.execute(
+        'INSERT INTO profiles (user_id, username, display_name, email) VALUES (?,?,?,?)',
+        [userId, username, username, email]
+      );
+      res.json({ success: true, created: true, profileId: profileResult.insertId });
+    } else {
+      res.json({ success: true, created: false, profile: existing[0] });
+    }
+  } catch (error) {
+    console.error('Ensure profile error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/fix-profile-username', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { username } = req.body;
+    
+    await pool.execute(
+      'UPDATE profiles SET username = ? WHERE user_id = ?',
+      [username, userId]
+    );
+    
+    res.json({ success: true, message: 'Profile username updated' });
+  } catch (error) {
+    console.error('Fix profile username error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/profiles/me/discord', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { discord_username, discord_id, discord_avatar } = req.body;
+    
+    await pool.execute(
+      'UPDATE profiles SET discord_connected = true, discord_username = ?, discord_avatar_url = ? WHERE user_id = ?',
+      [discord_username, discord_avatar ? `https://cdn.discordapp.com/avatars/${discord_id}/${discord_avatar}.png` : null, userId]
+    );
+    
+    res.json({ success: true, message: 'Discord connected successfully' });
+    
+  } catch (error) {
+    console.error('Discord connect error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/profiles/me/username', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { username } = req.body;
+    
+    if (!username || username.trim().length === 0) {
+      return res.status(400).json({ error: 'Username is required' });
+    }
+    
+    if (username.trim().length < 3) {
+      return res.status(400).json({ error: 'Username must be at least 3 characters long' });
+    }
+    
+    const [existing] = await pool.execute(
+      'SELECT id FROM profiles WHERE username = ? AND user_id != ?',
+      [username.trim(), userId]
+    );
+    
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Username is already taken' });
+    }
+    
+    await pool.execute(
+      'UPDATE profiles SET username = ? WHERE user_id = ?',
+      [username.trim(), userId]
+    );
+    
+    res.json({ success: true, message: 'Username updated successfully' });
+    
+  } catch (error) {
+    console.error('Update username error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/profiles/me/display-name', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { display_name } = req.body;
+    
+    if (!display_name || display_name.trim().length === 0) {
+      return res.status(400).json({ error: 'Display name is required' });
+    }
+    
+    if (display_name.trim().length > 50) {
+      return res.status(400).json({ error: 'Display name must be less than 50 characters' });
+    }
+    
+    await pool.execute(
+      'UPDATE profiles SET display_name = ? WHERE user_id = ?',
+      [display_name.trim(), userId]
+    );
+    
+    res.json({ success: true, message: 'Display name updated successfully' });
+    
+  } catch (error) {
+    console.error('Update display name error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   DISCORD OAUTH
+========================= */
+
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
+const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI || 'http://localhost:3001/api/auth/discord/callback';
+
+app.get('/api/auth/discord', (req, res) => {
+  if (!DISCORD_CLIENT_ID) {
+    return res.status(500).json({ error: 'Discord OAuth not configured' });
+  }
+  
+  const scope = 'identify email';
+  const authUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}&response_type=code&scope=${scope}`;
+  
+  res.redirect(authUrl);
+});
+
+app.get('/api/auth/discord/callback', async (req, res) => {
+  try {
+    const { code } = req.query;
+    
+    if (!code) {
+      return res.status(400).json({ error: 'Authorization code required' });
+    }
+    
+    if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
+      return res.status(500).json({ error: 'Discord OAuth not configured' });
+    }
+    
+    const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        client_id: DISCORD_CLIENT_ID,
+        client_secret: DISCORD_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code: code.toString(),
+        redirect_uri: DISCORD_REDIRECT_URI,
+      }),
+    });
+    
+    const tokenData = await tokenResponse.json();
+    
+    if (tokenData.error) {
+      return res.status(400).json({ error: 'Failed to exchange code for token' });
+    }
+    
+    const userResponse = await fetch('https://discord.com/api/users/@me', {
+      headers: {
+        'Authorization': `Bearer ${tokenData.access_token}`,
+      },
+    });
+    
+    const userData = await userResponse.json();
+    
+    if (userData.error) {
+      return res.status(400).json({ error: 'Failed to get user info from Discord' });
+    }
+    
+    res.redirect(`https://glowzy.lol/dashboard?discord_connected=true&discord_username=${userData.username}&discord_id=${userData.id}&discord_avatar=${userData.avatar}`);
+    
+  } catch (error) {
+    console.error('Discord OAuth callback error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   STRIPE PAYMENTS
+========================= */
+
+app.post('/api/create-checkout-session', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { priceId, successUrl, cancelUrl } = req.body;
+
+    if (!priceId || !successUrl || !cancelUrl) {
+      return res.status(400).json({ error: 'Missing required parameters' });
+    }
+
+    // Get user info
+    const [userRows] = await pool.execute(
+      'SELECT u.email, u.stripe_customer_id, p.username FROM users u JOIN profiles p ON u.id = p.user_id WHERE u.id = ?',
+      [userId]
+    );
+
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = userRows[0];
+    let customerId = user.stripe_customer_id;
+
+    // 🔥 create Stripe customer if not exists
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+      });
+
+      customerId = customer.id;
+
+      await pool.execute(
+        'UPDATE users SET stripe_customer_id = ? WHERE id = ?',
+        [customerId, userId]
+      );
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      billing_address_collection: 'auto',
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
+        },
+      ],
+      mode: 'subscription',
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: {
+        userId: userId.toString(),
+        username: user.username || user.email.split('@')[0],
+        type: 'premium',
+      },
+    });
+
+    res.json({ url: session.url });
+
+  } catch (error) {
+    console.error('Stripe checkout session error:', error.message, error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+// Purchase single product via Stripe (badges, tokens, etc.)
+app.post('/api/create-product-checkout', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { productName, price, description } = req.body;
+
+    if (!productName || !price) {
+      return res.status(400).json({ error: 'productName en price zijn verplicht' });
+    }
+
+    const [userRows] = await pool.execute(
+      'SELECT u.email, p.username FROM users u JOIN profiles p ON u.id = p.user_id WHERE u.id = ?',
+      [userId]
+    );
+
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: 'Gebruiker niet gevonden' });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      customer_email: userRows[0].email,
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          product_data: {
+            name: productName,
+            description: description || productName,
+          },
+          unit_amount: Math.round(parseFloat(price) * 100),
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.FRONTEND_URL || 'https://glowzy.lol'}/dashboard/badges?success=true&product=${encodeURIComponent(productName)}`,
+      cancel_url: `${process.env.FRONTEND_URL || 'https://glowzy.lol'}/pricing?cancelled=true`,
+      metadata: {
+        userId: userId.toString(),
+        user_id: userId.toString(),
+        type: 'product',
+        product_name: productName,
+      },
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Product checkout error:', error);
+    res.status(500).json({ error: 'Kon Stripe sessie niet aanmaken: ' + error.message });
+  }
+});
+
+// Cancel premium subscription
+app.post('/api/cancel-subscription', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Get user's Stripe customer ID
+    const [profileRows] = await pool.execute(
+      'SELECT stripe_customer_id FROM profiles WHERE user_id = ?',
+      [userId]
+    );
+    
+    if (profileRows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const profile = profileRows[0];
+    
+    if (!profile.stripe_customer_id) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+    
+    // Get active subscriptions for this customer
+    const subscriptions = await stripe.subscriptions.list({
+      customer: profile.stripe_customer_id,
+      status: 'active'
+    });
+    
+    if (subscriptions.data.length === 0) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+    
+    // Cancel the subscription at period end
+    const subscription = await stripe.subscriptions.update(
+      subscriptions.data[0].id,
+      { cancel_at_period_end: true }
+    );
+    
+    res.json({ 
+      message: 'Subscription will be cancelled at the end of the billing period',
+      cancelAt: subscriptions.data[0].current_period_end * 1000 // Convert to milliseconds
+    });
+    
+  } catch (error) {
+    console.error('Cancel subscription error:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+});
+
+
+
+/* =========================
+   ERROR HANDLERS
+========================= */
+
+// Zorg dat de Linkicon map bestaat
+const linkIconDir = path.join(process.cwd(), 'data', 'Linkicon');
+fs.mkdirSync(linkIconDir, { recursive: true });
+
+// Aparte multer config voor link icons (alleen images, max 2MB)
+const linkIconUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, linkIconDir),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      const unique = `${req.user.id}_${Date.now()}${ext}`;
+      cb(null, unique);
+    },
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml'];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only image files are allowed'));
+  },
+});
+
+// POST /api/link-icons/upload — upload een custom link icon
+app.post('/api/link-icons/upload', authenticate, linkIconUpload.single('icon'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const publicPath = `/api/link-icons/${req.file.filename}`;
+  res.json({ url: publicPath });
+});
+
+// GET /api/link-icons/:filename — serveer een icon bestand
+app.get('/api/link-icons/:filename', (req, res) => {
+  const filePath = path.join(linkIconDir, req.params.filename);
+  if (!fs.existsSync(filePath)) return res.status(404).end();
+  res.sendFile(filePath);
+});
+
+app.use((err, req, res, next) => {
+  console.error("Global error:", err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+/* =========================
+   CASINO API ENDPOINTS
+========================= */
+
+// Glowzycoin balance endpoints
+app.get('/api/glowzycoin/balance', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Get or create user balance
+    const [balanceRows] = await pool.execute(
+      'SELECT balance FROM user_glowzycoin WHERE user_id = ?',
+      [userId]
+    );
+    
+    if (balanceRows.length === 0) {
+      await pool.execute(
+        'INSERT INTO user_glowzycoin (user_id, balance) VALUES (?, 0)',
+        [userId]
+      );
+      return res.json({ balance: 0 });
+    }
+    
+    res.json({ balance: balanceRows[0].balance });
+  } catch (error) {
+    console.error('Balance fetch error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Daily claim endpoint
+app.post('/api/glowzycoin/daily-claim', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Check if already claimed today
+    const [claimRows] = await pool.execute(
+      'SELECT id FROM daily_claims WHERE user_id = ? AND claim_date = ?',
+      [userId, today]
+    );
+    
+    if (claimRows.length > 0) {
+      return res.status(400).json({ error: 'Already claimed today' });
+    }
+    
+    const dailyAmount = 100; // 100 Glowzycoins daily
+    
+    // Start transaction
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    
+    try {
+      // Get current balance first
+      const [balanceRows] = await pool.execute(
+        'SELECT balance FROM user_glowzycoin WHERE user_id = ?',
+        [userId]
+      );
+      
+      const currentBalance = balanceRows.length > 0 ? balanceRows[0].balance : 0;
+      const newBalance = currentBalance + dailyAmount;
+      
+      // Update or create balance
+      await connection.execute(
+        'INSERT INTO user_glowzycoin (user_id, balance) VALUES (?, ?) ON DUPLICATE KEY UPDATE balance = balance + ?',
+        [userId, dailyAmount, dailyAmount]
+      );
+      
+      // Record transaction
+      await connection.execute(
+        'INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)',
+        [userId, dailyAmount, 'daily_claim', 'Daily claim reward']
+      );
+      
+      // Record daily claim
+      await connection.execute(
+        'INSERT INTO daily_claims (user_id, claim_date) VALUES (?, ?)',
+        [userId, today]
+      );
+      
+      await connection.commit();
+      
+      res.json({ 
+        message: 'Daily claim successful!',
+        amount: dailyAmount,
+        newBalance: newBalance
+      });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Daily claim error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Check daily claim status endpoint
+app.get('/api/glowzycoin/daily-claim-status', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Check if already claimed today
+    const [claimRows] = await pool.execute(
+      'SELECT id FROM daily_claims WHERE user_id = ? AND claim_date = ?',
+      [userId, today]
+    );
+    
+    const canClaim = claimRows.length === 0;
+    
+    // Calculate time until next claim
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+    
+    const timeDiff = tomorrow.getTime() - now.getTime();
+    const hours = Math.floor(timeDiff / (1000 * 60 * 60));
+    const minutes = Math.floor((timeDiff % (1000 * 60 * 60)) / (1000 * 60));
+    const seconds = Math.floor((timeDiff % (1000 * 60)) / 1000);
+    
+    res.json({
+      canClaim,
+      timeUntilNextClaim: canClaim ? null : `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+    });
+  } catch (error) {
+    console.error('Daily claim status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Purchase Glowzycoins via Stripe
+app.post('/api/glowzycoin/purchase', authenticate, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    
+    if (!amount || amount < 1) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+    
+    const glowzycoins = amount * 1000;
+    
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          product_data: {
+            name: 'Glowzycoins',
+            description: `${glowzycoins} Glowzycoins`,
+          },
+          unit_amount: amount * 100,
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.FRONTEND_URL || 'https://glowzy.lol'}/casino?success=true&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL || 'https://glowzy.lol'}/casino?canceled=true`,
+      metadata: {
+        user_id: req.user.sub,
+        glowzycoins: glowzycoins.toString(),
+        type: 'glowzycoins',
+      }
+    });
+    
+    res.json({ sessionId: session.id, url: session.url });
+  } catch (error) {
+    console.error('Purchase error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}); // ← oude endpoint sluit hier
+
+// Purchase vaste coin pack of custom amount via Stripe
+app.post('/api/glowzycoin/purchase-pack', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { coins, price, name } = req.body;
+
+    if (!coins || !price || !name) {
+      return res.status(400).json({ error: 'coins, price en name zijn verplicht' });
+    }
+
+    const [userRows] = await pool.execute(
+      'SELECT u.email, p.username FROM users u JOIN profiles p ON u.id = p.user_id WHERE u.id = ?',
+      [userId]
+    );
+
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: 'Gebruiker niet gevonden' });
+    }
+
+    const user = userRows[0];
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      customer_email: user.email,
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          product_data: {
+            name: name,
+            description: `${parseInt(coins).toLocaleString('nl-NL')} Glowzycoins`,
+          },
+          unit_amount: Math.round(price * 100),
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.FRONTEND_URL || 'https://glowzy.lol'}/coins?success=true&coins=${coins}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL || 'https://glowzy.lol'}/coins?cancelled=true`,
+      metadata: {
+        userId: userId.toString(),
+        user_id: userId.toString(),
+        glowzycoins: coins.toString(),
+        type: 'glowzycoins',
+        pack_name: name,
+      },
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Purchase pack error:', error);
+    res.status(500).json({ error: 'Kon Stripe sessie niet aanmaken: ' + error.message });
+  }
+}); // ← nieuw endpoint sluit hier
+
+// Purchase premium with Glowzycoins
+app.post('/api/premium/purchase-with-coins', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const premiumCost = 5000; // 5000 Glowzycoins for premium
+    
+    // Check user balance
+    const [balanceRows] = await pool.execute(
+      'SELECT balance FROM user_glowzycoin WHERE user_id = ?',
+      [userId]
+    );
+    
+    if (balanceRows.length === 0 || balanceRows[0].balance < premiumCost) {
+      return res.status(400).json({ error: 'Insufficient Glowzycoins balance' });
+    }
+    
+    // Start transaction
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    
+    try {
+      // Update balance (deduct premium cost)
+      await connection.execute(
+        'UPDATE user_glowzycoin SET balance = balance - ? WHERE user_id = ?',
+        [premiumCost, userId]
+      );
+      
+      // Record transaction
+      await connection.execute(
+        'INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)',
+        [userId, -premiumCost, 'premium_purchase', 'Premium membership purchase']
+      );
+      
+      // Update user premium status in profiles table
+      await connection.execute(
+        'UPDATE profiles SET is_premium = 1 WHERE user_id = ?',
+        [userId]
+      );
+      
+      await connection.commit();
+      
+      res.json({ 
+        message: 'Premium purchased successfully!',
+        cost: premiumCost,
+        newBalance: balanceRows[0].balance - premiumCost,
+        premiumExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString()
+      });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Premium purchase error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Rock Paper Scissors Game
+app.post('/api/casino/rock-paper-scissors', authenticate, async (req, res) => {
+  try {
+    const { betAmount, playerChoice } = req.body;
+    const userId = req.user.sub;
+
+    if (!betAmount || betAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid bet amount' });
+    }
+    if (!['rock', 'paper', 'scissors'].includes(playerChoice)) {
+      return res.status(400).json({ error: 'Invalid player choice' });
+    }
+
+    const [balanceRows] = await pool.execute(
+      'SELECT balance FROM user_glowzycoin WHERE user_id = ?',
+      [userId]
+    );
+
+    if (balanceRows.length === 0 || balanceRows[0].balance < betAmount) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    const choices = ['rock', 'paper', 'scissors'];
+    const computerChoice = choices[Math.floor(Math.random() * choices.length)];
+
+    let result = ''; // 'win', 'lose', 'draw'
+    let winAmount = 0;
+
+    if (playerChoice === computerChoice) {
+      result = 'draw';
+      winAmount = betAmount; // Return bet amount on draw
+    } else if (
+      (playerChoice === 'rock' && computerChoice === 'scissors') ||
+      (playerChoice === 'paper' && computerChoice === 'rock') ||
+      (playerChoice === 'scissors' && computerChoice === 'paper')
+    ) {
+      result = 'win';
+      winAmount = betAmount * 2; // Double bet amount on win
+    } else {
+      result = 'lose';
+      winAmount = 0; // Lose bet amount
+    }
+
+    const profitLoss = winAmount - betAmount;
+
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+      await connection.execute(
+        'UPDATE user_glowzycoin SET balance = balance + ? WHERE user_id = ?',
+        [profitLoss, userId]
+      );
+
+      await connection.execute(
+        'INSERT INTO casino_games (user_id, game_type, bet_amount, win_amount, game_result, profit_loss) VALUES (?, ?, ?, ?, ?, ?)',
+        [userId, 'rock_paper_scissors', betAmount, winAmount, JSON.stringify({ playerChoice, computerChoice, result }), profitLoss]
+      );
+
+      await connection.execute(
+        'INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)',
+        [userId, profitLoss, result === 'win' ? 'win' : result === 'lose' ? 'loss' : 'draw', `RPS: ${playerChoice} vs ${computerChoice} - ${result}`]
+      );
+
+      await connection.commit();
+
+      res.json({
+        playerChoice,
+        computerChoice,
+        result,
+        winAmount,
+        profitLoss,
+        newBalance: balanceRows[0].balance + profitLoss
+      });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Rock Paper Scissors error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Hall of Fame API
+app.get('/api/casino/hall-of-fame', async (req, res) => {
+  try {
+    const [topUsers] = await pool.execute(`
+      SELECT u.username, u.email, ug.balance, 
+             COUNT(cg.id) as total_games,
+             SUM(CASE WHEN cg.profit_loss > 0 THEN 1 ELSE 0 END) as wins,
+             SUM(cg.profit_loss) as total_profit_loss
+      FROM user_glowzycoin ug
+      JOIN users u ON ug.user_id = u.id
+      LEFT JOIN casino_games cg ON ug.user_id = cg.user_id
+      GROUP BY ug.user_id, u.username, u.email, ug.balance
+      ORDER BY ug.balance DESC, total_profit_loss DESC
+      LIMIT 10
+    `);
+
+    res.json({ topUsers });
+  } catch (error) {
+    console.error('Hall of Fame error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Spin the Wheel Game
+app.post('/api/casino/spin-wheel', authenticate, async (req, res) => {
+  try {
+    const { betAmount } = req.body;
+    const userId = req.user.sub;
+
+    if (!betAmount || betAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid bet amount' });
+    }
+
+    // Check user balance
+    const [balanceRows] = await pool.execute(
+      'SELECT balance FROM user_glowzycoin WHERE user_id = ?',
+      [userId]
+    );
+
+    if (balanceRows.length === 0 || balanceRows[0].balance < betAmount) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    // Spin the wheel - 8 segments with different multipliers
+    const segments = [
+      { label: '2x', multiplier: 2, color: 'green' },
+      { label: '1x', multiplier: 1, color: 'blue' },
+      { label: '0.5x', multiplier: 0.5, color: 'red' },
+      { label: '3x', multiplier: 3, color: 'gold' },
+      { label: '1x', multiplier: 1, color: 'blue' },
+      { label: '0x', multiplier: 0, color: 'red' },
+      { label: '2x', multiplier: 2, color: 'green' },
+      { label: '5x', multiplier: 5, color: 'purple' }
+    ];
+    
+    const result = segments[Math.floor(Math.random() * segments.length)];
+    const winAmount = betAmount * result.multiplier;
+    const profitLoss = winAmount - betAmount;
+
+    // Update balance and record game
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+      // Update balance
+      await connection.execute(
+        'UPDATE user_glowzycoin SET balance = balance + ? WHERE user_id = ?',
+        [profitLoss, userId]
+      );
+
+      // Record game
+      await connection.execute(
+        'INSERT INTO casino_games (user_id, game_type, bet_amount, win_amount, game_result, profit_loss) VALUES (?, ?, ?, ?, ?, ?)',
+        [userId, 'spin_wheel', betAmount, winAmount, JSON.stringify({ result }), profitLoss]
+      );
+
+      // Record transaction
+      await connection.execute(
+        'INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)',
+        [userId, profitLoss, profitLoss >= 0 ? 'win' : 'loss', `Spin the wheel: ${result.label} - ${profitLoss >= 0 ? 'WIN' : 'LOSE'}`]
+      );
+
+      await connection.commit();
+
+      res.json({
+        result,
+        winAmount,
+        profitLoss,
+        newBalance: balanceRows[0].balance + profitLoss
+      });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Spin the wheel error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Slot Machine Game
+app.post('/api/casino/slot-machine', authenticate, async (req, res) => {
+  try {
+    const { betAmount } = req.body;
+    const userId = req.user.sub;
+
+    if (!betAmount || betAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid bet amount' });
+    }
+
+    // Check user balance
+    const [balanceRows] = await pool.execute(
+      'SELECT balance FROM user_glowzycoin WHERE user_id = ?',
+      [userId]
+    );
+
+    if (balanceRows.length === 0 || balanceRows[0].balance < betAmount) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    // Slot machine symbols
+    const symbols = ['🍒', '🍋', '🍊', '🍇', '💎', '7️⃣'];
+    const payouts = {
+      '🍒': 2, '🍋': 3, '🍊': 4, '🍇': 5, '💎': 10, '7️⃣': 50
+    };
+
+    // Spin 3 reels
+    const reels = [];
+    for (let i = 0; i < 3; i++) {
+      reels.push(symbols[Math.floor(Math.random() * symbols.length)]);
+    }
+
+    // Check for wins
+    let winAmount = 0;
+    let winType = '';
+
+    // Three of a kind
+    if (reels[0] === reels[1] && reels[1] === reels[2]) {
+      winAmount = betAmount * payouts[reels[0]];
+      winType = `Three ${reels[0]}`;
+    }
+    // Two of a kind
+    else if (reels[0] === reels[1] || reels[1] === reels[2] || reels[0] === reels[2]) {
+      const matchingSymbol = reels[0] === reels[1] ? reels[0] : reels[1] === reels[2] ? reels[1] : reels[0];
+      winAmount = betAmount * 0.5;
+      winType = `Two ${matchingSymbol}`;
+    }
+
+    const profitLoss = winAmount - betAmount;
+
+    // Update balance and record game
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+      // Update balance
+      await connection.execute(
+        'UPDATE user_glowzycoin SET balance = balance + ? WHERE user_id = ?',
+        [profitLoss, userId]
+      );
+
+      // Record game
+      await connection.execute(
+        'INSERT INTO casino_games (user_id, game_type, bet_amount, win_amount, game_result, profit_loss) VALUES (?, ?, ?, ?, ?, ?)',
+        [userId, 'slot_machine', betAmount, winAmount, JSON.stringify({ reels, winType }), profitLoss]
+      );
+
+      // Record transaction
+      await connection.execute(
+        'INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)',
+        [userId, profitLoss, profitLoss >= 0 ? 'win' : 'loss', `Slot machine: ${winType} - ${profitLoss >= 0 ? 'WIN' : 'LOSE'}`]
+      );
+
+      await connection.commit();
+
+      res.json({
+        reels,
+        winType,
+        winAmount,
+        profitLoss,
+        newBalance: balanceRows[0].balance + profitLoss
+      });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Slot machine error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Range Roulette Game
+app.post('/api/casino/range-roulette', authenticate, async (req, res) => {
+  try {
+    const { betAmount, range, prediction } = req.body; // range: 1-10, 1-50, 1-100; prediction: 'low' or 'high'
+    const userId = req.user.sub;
+
+    if (!betAmount || betAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid bet amount' });
+    }
+
+    if (!range || !prediction || !['low', 'high'].includes(prediction)) {
+      return res.status(400).json({ error: 'Invalid range or prediction' });
+    }
+
+    // Check user balance
+    const [balanceRows] = await pool.execute(
+      'SELECT balance FROM user_glowzycoin WHERE user_id = ?',
+      [userId]
+    );
+
+    if (balanceRows.length === 0 || balanceRows[0].balance < betAmount) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    // Generate random number
+    const maxNumber = range === '1-10' ? 10 : range === '1-50' ? 50 : 100;
+    const randomNumber = Math.floor(Math.random() * maxNumber) + 1;
+    
+    // Determine winner
+    const middlePoint = maxNumber / 2;
+    const isLow = randomNumber <= middlePoint;
+    const won = (prediction === 'low' && isLow) || (prediction === 'high' && !isLow);
+    
+    let winAmount = 0;
+    let multiplier = 1;
+    
+    if (won) {
+      multiplier = range === '1-10' ? 2 : range === '1-50' ? 3 : 4;
+      winAmount = betAmount * multiplier;
+    }
+
+    const profitLoss = winAmount - betAmount;
+
+    // Update balance and record game
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+      // Update balance
+      await connection.execute(
+        'UPDATE user_glowzycoin SET balance = balance + ? WHERE user_id = ?',
+        [profitLoss, userId]
+      );
+
+      // Record game
+      await connection.execute(
+        'INSERT INTO casino_games (user_id, game_type, bet_amount, win_amount, game_result, profit_loss) VALUES (?, ?, ?, ?, ?, ?)',
+        [userId, 'range_roulette', betAmount, winAmount, JSON.stringify({ randomNumber, range, prediction, won, multiplier }), profitLoss]
+      );
+
+      // Record transaction
+      await connection.execute(
+        'INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)',
+        [userId, profitLoss, won ? 'win' : 'loss', `Range roulette (${range}): ${randomNumber} - ${prediction} - ${won ? 'WIN' : 'LOSE'}`]
+      );
+
+      await connection.commit();
+
+      res.json({
+        randomNumber,
+        range,
+        prediction,
+        won,
+        multiplier,
+        winAmount,
+        profitLoss,
+        newBalance: balanceRows[0].balance + profitLoss
+      });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Range roulette error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Dice Roll Game
+app.post('/api/casino/dice-roll', authenticate, async (req, res) => {
+  try {
+    const { betAmount, prediction } = req.body;
+    const userId = req.user.sub;
+
+    if (!betAmount || betAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid bet amount' });
+    }
+
+    const [balanceRows] = await pool.execute(
+      'SELECT balance FROM user_glowzycoin WHERE user_id = ?',
+      [userId]
+    );
+
+    if (balanceRows.length === 0 || balanceRows[0].balance < betAmount) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    const diceResult = Math.floor(Math.random() * 6) + 1;
+    
+    let won = false;
+    if (prediction === 'low') won = diceResult <= 3;
+    else if (prediction === 'high') won = diceResult >= 4;
+    else won = diceResult === parseInt(prediction);
+
+    const multiplier = prediction === 'low' || prediction === 'high' ? 2 : 6;
+    const winAmount = won ? betAmount * multiplier : 0;
+    const profitLoss = winAmount - betAmount;
+
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    try {
+      await connection.execute(
+        'UPDATE user_glowzycoin SET balance = balance + ? WHERE user_id = ?',
+        [profitLoss, userId]
+      );
+      await connection.execute(
+        'INSERT INTO casino_games (user_id, game_type, bet_amount, win_amount, game_result, profit_loss) VALUES (?, ?, ?, ?, ?, ?)',
+        [userId, 'dice_roll', betAmount, winAmount, JSON.stringify({ diceResult, prediction, won }), profitLoss]
+      );
+      await connection.execute(
+        'INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)',
+        [userId, profitLoss, won ? 'win' : 'loss', `Dice roll: ${diceResult} - ${prediction} - ${won ? 'WIN' : 'LOSE'}`]
+      );
+      await connection.commit();
+      res.json({ diceResult, won, winAmount, profitLoss, newBalance: balanceRows[0].balance + profitLoss });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Dice roll error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Roulette Game
+app.post('/api/casino/roulette', authenticate, async (req, res) => {
+  try {
+    const { bets, totalBet } = req.body;
+    const userId = req.user.sub;
+
+    if (!bets || typeof bets !== 'object' || !totalBet || totalBet <= 0) {
+      return res.status(400).json({ error: 'Invalid bet' });
+    }
+
+    const [balanceRows] = await pool.execute(
+      'SELECT balance FROM user_glowzycoin WHERE user_id = ?',
+      [userId]
+    );
+
+    if (balanceRows.length === 0 || balanceRows[0].balance < totalBet) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    // Spin: random getal 0-36
+    const result = Math.floor(Math.random() * 37);
+
+    const RED_NUMBERS = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
+
+    // Bereken winst per bet
+    let totalWin = 0;
+    for (const [key, betAmount] of Object.entries(bets)) {
+      const amount = Number(betAmount);
+      let payout = 0;
+
+      if (key === String(result)) {
+        payout = amount * 35; // Straight up: 35:1
+      } else if (key === 'red' && RED_NUMBERS.has(result)) {
+        payout = amount * 2;
+      } else if (key === 'black' && result !== 0 && !RED_NUMBERS.has(result)) {
+        payout = amount * 2;
+      } else if (key === 'even' && result !== 0 && result % 2 === 0) {
+        payout = amount * 2;
+      } else if (key === 'odd' && result % 2 === 1) {
+        payout = amount * 2;
+      } else if (key === '1-18' && result >= 1 && result <= 18) {
+        payout = amount * 2;
+      } else if (key === '19-36' && result >= 19 && result <= 36) {
+        payout = amount * 2;
+      } else if (key === '1st12' && result >= 1 && result <= 12) {
+        payout = amount * 3;
+      } else if (key === '2nd12' && result >= 13 && result <= 24) {
+        payout = amount * 3;
+      } else if (key === '3rd12' && result >= 25 && result <= 36) {
+        payout = amount * 3;
+      } else if (key === 'col1' && result % 3 === 1) {
+        payout = amount * 3;
+      } else if (key === 'col2' && result % 3 === 2) {
+        payout = amount * 3;
+      } else if (key === 'col3' && result % 3 === 0 && result !== 0) {
+        payout = amount * 3;
+      }
+
+      totalWin += payout;
+    }
+
+    const profitLoss = totalWin - totalBet;
+
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    try {
+      await connection.execute(
+        'UPDATE user_glowzycoin SET balance = balance + ? WHERE user_id = ?',
+        [profitLoss, userId]
+      );
+      await connection.execute(
+        'INSERT INTO casino_games (user_id, game_type, bet_amount, win_amount, game_result, profit_loss) VALUES (?, ?, ?, ?, ?, ?)',
+        [userId, 'roulette', totalBet, totalWin, JSON.stringify({ result, bets }), profitLoss]
+      );
+      await connection.execute(
+        'INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)',
+        [userId, profitLoss, profitLoss >= 0 ? 'win' : 'loss', `Roulette: ${result} - ${profitLoss >= 0 ? 'WIN' : 'LOSE'}`]
+      );
+      await connection.commit();
+
+      res.json({
+        result,
+        winAmount: totalWin,
+        profitLoss,
+        newBalance: balanceRows[0].balance + profitLoss
+      });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Roulette error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   TEMPLATES
+========================= */
+
+// Create templates table endpoint
+app.post('/api/create-templates-table', async (req, res) => {
+  try {
+    // Disable foreign key checks temporarily
+    await pool.execute('SET FOREIGN_KEY_CHECKS = 0');
+    
+    // Drop existing table
+    await pool.execute('DROP TABLE IF EXISTS templates');
+    
+    await pool.execute(`
+      CREATE TABLE templates (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        author_id INT NOT NULL,
+        author_username VARCHAR(100),
+        preview_image VARCHAR(255),
+        category VARCHAR(100),
+        tags JSON,
+        is_premium BOOLEAN DEFAULT FALSE,
+        is_public BOOLEAN DEFAULT TRUE,
+        uses INT DEFAULT 0,
+        downloads INT DEFAULT 0,
+        rating DECIMAL(3,2) DEFAULT 0.00,
+        status ENUM('draft', 'published', 'archived') DEFAULT 'published',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Re-enable foreign key checks
+    await pool.execute('SET FOREIGN_KEY_CHECKS = 1');
+
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS template_downloads (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        template_id INT NOT NULL,
+        user_id INT,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+      )
+    `);
+    
+    res.json({ success: true, message: 'Templates tables created successfully' });
+  } catch (error) {
+    console.error('Create templates table error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/templates - list all public templates
+app.get('/api/templates', async (req, res) => {
+  try {
+    const { category, search, sort = 'created_at', order = 'DESC', limit = 50, offset = 0 } = req.query;
+    
+    let query = `
+      SELECT t.*, u.username as author_username,
+             (SELECT COUNT(*) FROM template_downloads td WHERE td.template_id = t.id) as download_count
+      FROM templates t
+      JOIN users u ON t.author_id = u.id
+      WHERE t.status = 'published' AND t.is_public = true
+    `;
+    
+    const params = [];
+    
+    if (category) {
+      query += ' AND t.category = ?';
+      params.push(category);
+    }
+    
+    if (search) {
+      query += ' AND (t.name LIKE ? OR t.description LIKE ?)';
+      params.push(`%${search}%`, `%${search}%`);
+    }
+    
+    const allowedSorts = ['name', 'created_at', 'downloads', 'rating'];
+    const sortField = allowedSorts.includes(sort) ? sort : 'created_at';
+    const sortOrder = order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+    
+    query += ` ORDER BY t.${sortField} ${sortOrder}`;
+    
+    query += ' LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const [templates] = await pool.execute(query, params);
+    
+    let countQuery = `
+      SELECT COUNT(*) as total 
+      FROM templates t 
+      WHERE t.status = 'published' AND t.is_public = true
+    `;
+    const countParams = [];
+    
+    if (category) {
+      countQuery += ' AND t.category = ?';
+      countParams.push(category);
+    }
+    
+    if (search) {
+      countQuery += ' AND (t.name LIKE ? OR t.description LIKE ?)';
+      countParams.push(`%${search}%`, `%${search}%`);
+    }
+    
+    const [countResult] = await pool.execute(countQuery, countParams);
+    
+    res.json({
+      templates,
+      total: countResult[0].total,
+      hasMore: (parseInt(offset) + parseInt(limit)) < countResult[0].total
+    });
+  } catch (error) {
+    console.error('Get templates error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/templates/:id - get single template
+app.get('/api/templates/:id', async (req, res) => {
+  try {
+    const [templates] = await pool.execute(`
+      SELECT t.*, u.username as author_username,
+             (SELECT COUNT(*) FROM template_downloads td WHERE td.template_id = t.id) as download_count
+      FROM templates t
+      JOIN users u ON t.author_id = u.id
+      WHERE t.id = ? AND t.status = 'published' AND t.is_public = true
+    `, [req.params.id]);
+    
+    if (templates.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    res.json(templates[0]);
+  } catch (error) {
+    console.error('Get template error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Test endpoint for template insertion
+app.get('/api/test-template', async (req, res) => {
+  try {
+    const [result] = await pool.execute(`
+      INSERT INTO templates (name, description, author_id, author_username, preview_image, category, tags, is_premium, is_public, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published')
+    `, [
+      'Test Template',
+      'A test template for debugging',
+      '9',
+      'dexter',
+      null,
+      'bio',
+      JSON.stringify(['test', 'debug']),
+      false,
+      true
+    ]);
+    
+    console.log('Test template inserted with ID:', result.insertId);
+    
+    const [templates] = await pool.execute('SELECT * FROM templates ORDER BY id DESC LIMIT 5');
+    
+    res.json({
+      message: 'Test template created',
+      insertId: result.insertId,
+      recentTemplates: templates
+    });
+  } catch (error) {
+    console.error('Test template error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+app.post('/api/templates/:id/use', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const templateId = req.params.id;
+
+    console.log(`[USE TEMPLATE] User ${userId} attempting to use template ${templateId}`);
+
+    // Haal template op
+    const [templates] = await pool.execute(
+      'SELECT * FROM templates WHERE id = ? AND status = "published" AND is_public = true',
+      [templateId]
+    );
+
+    if (templates.length === 0) {
+      console.log('[USE TEMPLATE] Template not found or not public');
+      return res.status(404).json({ error: 'Template not found' });
+    }
+
+    const template = templates[0];
+    console.log('[USE TEMPLATE] Template found:', template.name);
+
+    // Parse config indien aanwezig
+    let config = null;
+    if (template.config) {
+      try {
+        config = typeof template.config === 'string'
+          ? JSON.parse(template.config)
+          : template.config;
+        console.log('[USE TEMPLATE] Config parsed:', config);
+      } catch (e) {
+        console.error('[USE TEMPLATE] Failed to parse config:', e);
+      }
+    }
+
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+      // Als er config is, pas deze toe op het profiel
+      if (config && Object.keys(config).length > 0) {
+        console.log('[USE TEMPLATE] Applying config to profile...');
+        
+        // Bouw dynamische UPDATE query op basis van beschikbare config velden
+        const updates = [];
+        const values = [];
+        
+        // Alle mogelijke velden die in config kunnen zitten
+        const configFields = {
+          background_color: 'background_color',
+          text_color: 'text_color',
+          button_style: 'button_style',
+          theme: 'theme',
+          font_family: 'font_family',
+          accent_color: 'accent_color',
+          border_radius: 'border_radius',
+          layout: 'layout',
+          custom_css: 'custom_css'
+        };
+        
+        for (const [configKey, dbColumn] of Object.entries(configFields)) {
+          if (config[configKey] !== undefined && config[configKey] !== null) {
+            updates.push(`${dbColumn} = ?`);
+            values.push(config[configKey]);
+          }
+        }
+        
+        if (updates.length > 0) {
+          values.push(userId);
+          const updateQuery = `UPDATE profile_customization SET ${updates.join(', ')} WHERE user_id = ?`;
+          console.log('[USE TEMPLATE] Executing update:', updateQuery);
+          console.log('[USE TEMPLATE] Values:', values);
+          
+          await connection.execute(updateQuery, values);
+          console.log('[USE TEMPLATE] Profile customization updated successfully');
+        } else {
+          console.log('[USE TEMPLATE] No valid config fields to update');
+        }
+
+        // Avatar toepassen op profiles tabel
+        if (config.avatar_url) {
+          await connection.execute(
+            'UPDATE profiles SET avatar_url = ? WHERE user_id = ?',
+            [config.avatar_url, userId]
+          );
+          console.log('[USE TEMPLATE] Avatar applied to profile');
+        }
+      } else {
+        console.log('[USE TEMPLATE] No config to apply');
+      }
+
+      // Registreer gebruik in template_downloads
+      console.log('[USE TEMPLATE] Recording template download...');
+      await connection.execute(
+        'INSERT INTO template_downloads (template_id, user_id) VALUES (?, ?)',
+        [templateId, userId]
+      );
+
+      // Verhoog uses counter
+      console.log('[USE TEMPLATE] Incrementing uses counter...');
+      await connection.execute(
+        'UPDATE templates SET uses = uses + 1 WHERE id = ?',
+        [templateId]
+      );
+
+      await connection.commit();
+      console.log('[USE TEMPLATE] ✅ Template applied successfully');
+
+      res.json({ 
+        success: true, 
+        message: 'Template applied to profile',
+        applied_config: config,
+        fields_updated: config ? Object.keys(config).length : 0
+      });
+
+    } catch (error) {
+      await connection.rollback();
+      console.error('[USE TEMPLATE] Transaction error:', error);
+      throw error;
+    } finally {
+      connection.release();
+    }
+
+  } catch (error) {
+    console.error('[USE TEMPLATE] ❌ Error:', error);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      details: error.message 
+    });
+  }
+});
+
+// Gift Premium aan gebruiker
+app.post('/api/casino/gift-premium', authenticate, async (req, res) => {
+  try {
+    const senderId = req.user.sub;
+    const { targetUserId } = req.body;
+    const cost = 5000;
+
+    if (!targetUserId) return res.status(400).json({ error: 'targetUserId required' });
+    if (String(senderId) === String(targetUserId)) return res.status(400).json({ error: 'Je kan niet aan jezelf giften' });
+
+    const [balanceRows] = await pool.execute('SELECT balance FROM user_glowzycoin WHERE user_id = ?', [senderId]);
+    if (balanceRows.length === 0 || balanceRows[0].balance < cost) return res.status(400).json({ error: 'Insufficient balance' });
+
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    try {
+      await connection.execute('UPDATE user_glowzycoin SET balance = balance - ? WHERE user_id = ?', [cost, senderId]);
+      await connection.execute('UPDATE profiles SET is_premium = 1 WHERE user_id = ?', [targetUserId]);
+      await connection.execute('INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)', [senderId, -cost, 'gift_premium', `Premium gifted aan user ${targetUserId}`]);
+      await connection.commit();
+
+      // Log de gift in casino_logs
+      await pool.execute(
+        'INSERT INTO casino_logs (type, sender_id, receiver_id, amount) VALUES (?, ?, ?, ?)',
+        ['gift_premium', senderId, targetUserId, cost]
+      );
+
+      res.json({ newBalance: balanceRows[0].balance - cost });
+    } catch (e) { await connection.rollback(); throw e; }
+    finally { connection.release(); }
+  } catch (error) {
+    console.error('Gift premium error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Gift Coins aan gebruiker
+app.post('/api/casino/gift-coins', authenticate, async (req, res) => {
+  try {
+    const senderId = req.user.sub;
+    const { targetUserId, amount } = req.body;
+
+    if (!targetUserId || !amount || amount < 1) return res.status(400).json({ error: 'Invalid request' });
+    if (String(senderId) === String(targetUserId)) return res.status(400).json({ error: 'Je kan niet aan jezelf sturen' });
+
+    const [balanceRows] = await pool.execute('SELECT balance FROM user_glowzycoin WHERE user_id = ?', [senderId]);
+    if (balanceRows.length === 0 || balanceRows[0].balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
+
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    try {
+      await connection.execute('UPDATE user_glowzycoin SET balance = balance - ? WHERE user_id = ?', [amount, senderId]);
+      await connection.execute('INSERT INTO user_glowzycoin (user_id, balance) VALUES (?, ?) ON DUPLICATE KEY UPDATE balance = balance + ?', [targetUserId, amount, amount]);
+      await connection.execute('INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)', [senderId, -amount, 'gift_coins', `Coins gestuurd naar user ${targetUserId}`]);
+      await connection.execute('INSERT INTO glowzycoin_transactions (user_id, amount, transaction_type, description) VALUES (?, ?, ?, ?)', [targetUserId, amount, 'gift_received', `Coins ontvangen van user ${senderId}`]);
+      await connection.commit();
+
+      // Log de gift in casino_logs
+      await pool.execute(
+        'INSERT INTO casino_logs (type, sender_id, receiver_id, amount) VALUES (?, ?, ?, ?)',
+        ['gift_coins', senderId, targetUserId, amount]
+      );
+
+      res.json({ newBalance: balanceRows[0].balance - amount });
+    } catch (e) { await connection.rollback(); throw e; }
+    finally { connection.release(); }
+  } catch (error) {
+    console.error('Gift coins error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   LEADERBOARD
+========================= */
+
+// Top 100 - profile views
+app.get('/api/leaderboard/views', async (req, res) => {
+  try {
+    const [rows] = await pool.execute(`
+      SELECT 
+        p.username,
+        p.display_name,
+        p.avatar_url,
+        p.is_premium,
+        COUNT(pv.id) as views
+      FROM profiles p
+      LEFT JOIN profile_views pv ON pv.profile_user_id = p.user_id
+      GROUP BY p.user_id, p.username, p.display_name, p.avatar_url, p.is_premium
+      ORDER BY views DESC
+      LIMIT 100
+    `);
+
+    const ranked = rows.map((row, i) => ({ rank: i + 1, ...row }));
+    res.json(ranked);
+  } catch (error) {
+    console.error('Leaderboard views error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Top 100 - coins balance
+app.get('/api/leaderboard/coins', async (req, res) => {
+  try {
+    const [rows] = await pool.execute(`
+      SELECT 
+        p.username,
+        p.display_name,
+        p.avatar_url,
+        p.is_premium,
+        ug.balance
+      FROM user_glowzycoin ug
+      JOIN profiles p ON p.user_id = ug.user_id
+      WHERE ug.balance > 0
+      ORDER BY ug.balance DESC
+      LIMIT 100
+    `);
+
+    const ranked = rows.map((row, i) => ({ rank: i + 1, ...row }));
+    res.json(ranked);
+  } catch (error) {
+    console.error('Leaderboard coins error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* =========================
+   SEO / OPEN GRAPH per profiel
+========================= */
+app.get("/:username", async (req, res) => {
+  const { username } = req.params;
+
+  // Sla interne routes en React app-routes over
+  const reserved = [
+    "api", "favicon.ico", "uploads", "audio", "static", "assets",
+    // React app routes — bij refresh stuurt server index.html
+    "dashboard", "settings", "customize", "login", "register",
+    "pricing", "admin", "profile", "badges", "links", "analytics",
+    "casino", "templates", "leaderboard", "notifications",
+  ];
+  if (reserved.some(r => username.startsWith(r))) {
+    // Stuur index.html zodat React de route zelf afhandelt
+    const __dirnameFixed = path.dirname(new URL(import.meta.url).pathname);
+    return res.sendFile(path.join(__dirnameFixed, "../dist", "index.html"));
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      "SELECT username, display_name, description, avatar_url FROM profiles WHERE username = ?",
+      [username]
+    );
+
+    if (rows.length === 0) {
+      return res.redirect(`https://glowzy.lol/?notfound=${username}`);
+    }
+
+    const profile = rows[0];
+    const name = profile.display_name || profile.username;
+    const bio = profile.description || `Bekijk het profiel van ${name} op Glowzy.lol`;
+    const avatar = profile.avatar_url
+    ? `https://glowzy.lol/api/public-avatar/${username}`
+    : `https://glowzy.lol/default-avatar.png`;
+    const url = `https://glowzy.lol/${username}`;
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    const { js, css } = getAssetFiles();
+    res.send(`<!DOCTYPE html>
+<html lang="nl">
+  <head>
+    <meta charset="UTF-8">
+    <title>${name} | Glowzy.lol</title>
+    <meta name="description" content="${bio}">
+
+    <!-- Open Graph (Discord, Facebook preview) -->
+    <meta property="og:title" content="${name} | Glowzy.lol">
+    <meta property="og:description" content="${bio}">
+    <meta property="og:image" content="${avatar}">
+    <meta property="og:url" content="${url}">
+    <meta property="og:type" content="profile">
+    <meta property="og:site_name" content="Glowzy.lol">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="${name} | Glowzy.lol">
+    <meta name="twitter:description" content="${bio}">
+    <meta name="twitter:image" content="${avatar}">
+  </head>
+  <body>
+  <div id="root"></div>
+  ${js ? `<script type="module" src="/assets/${js}"></script>` : ''}
+  ${css ? `<link rel="stylesheet" href="/assets/${css}">` : ''}
+</body>
+</html>`);
+
+  } catch (error) {
+    console.error("SEO route error:", error);
+    res.redirect("https://glowzy.lol");
+  }
+});
+/* =========================
+   SERVER
+========================= */
+app.get("/", (req, res) => {
+  const __dirnameFixed = path.dirname(new URL(import.meta.url).pathname);
+  res.sendFile(path.join(__dirnameFixed, "../dist", "index.html"));
+});
+
+// Catch-all: stuur altijd index.html zodat React Router de route afhandelt.
+app.use((req, res) => {
+  const __dirnameFixed = path.dirname(new URL(import.meta.url).pathname);
+  res.sendFile(path.join(__dirnameFixed, "../dist", "index.html"));
+});
+
+// Initialize templates table on startup
+const initializeTemplatesTable = async () => {
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS templates (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        author_id INT NOT NULL,
+        author_username VARCHAR(255) NOT NULL,
+        preview_image VARCHAR(500),
+        category VARCHAR(100) DEFAULT 'bio',
+        tags JSON,
+        config JSON,
+        is_premium BOOLEAN DEFAULT FALSE,
+        is_public BOOLEAN DEFAULT TRUE,
+        status ENUM('draft', 'published', 'archived') DEFAULT 'published',
+        uses INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS template_downloads (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        template_id INT UNSIGNED NOT NULL,
+        user_id INT UNSIGNED,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+      )
+    `);
+    
+    // Add config column if it doesn't exist (for existing databases)
+    try {
+      await pool.execute(`
+        ALTER TABLE templates 
+        ADD COLUMN IF NOT EXISTS config JSON AFTER tags
+      `);
+      console.log('✅ Config column added/verified');
+    } catch (error) {
+      // Column might already exist, or MySQL version doesn't support IF NOT EXISTS
+      console.log('ℹ️  Config column check:', error.message);
+    }
+    
+    // Create template_favorites table
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS template_favorites (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        template_id INT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_fav (user_id, template_id),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE CASCADE
+      )
+    `);
+
+    console.log('✅ Templates tables initialized successfully');
+  } catch (error) {
+    console.error('❌ Failed to initialize templates tables:', error.message);
+  }
+};
+
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, async () => {
+  console.log(`API running on http://localhost:${PORT}`);
+  await initializeTemplatesTable();
+});
