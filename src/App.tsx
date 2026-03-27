@@ -22,7 +22,7 @@ import Links from "./pages/dashboard/Links";
 import Premium from "./pages/dashboard/Premium";
 import ImageHost from "./pages/dashboard/ImageHost";
 import Templates from "./pages/dashboard/Templates";
-import TemplateDetail from "./pages/dashboard/TemplateDetail";
+import TemplateDetail from "./pages/dashboard/Templatedetail";
 import NotFound from "./pages/NotFound";
 import Coins from "./pages/Coins";
 
