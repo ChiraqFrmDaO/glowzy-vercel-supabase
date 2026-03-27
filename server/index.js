@@ -1,5 +1,4 @@
 import express from 'express';
-import mysql from 'mysql2/promise';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import path from 'path';
@@ -12,8 +11,8 @@ import dotenv from 'dotenv';
 import Stripe from 'stripe';
 import { TOTP, NobleCryptoPlugin, ScureBase32Plugin } from 'otplib';
 import QRCode from 'qrcode';
-// Add raw body parser for Stripe webhooks
 import bodyParser from 'body-parser';
+import { pool, supabase } from './supabase-client.js';
 
 // Initialize TOTP with crypto and base32 plugins
 const totp = new TOTP({
@@ -169,25 +168,14 @@ const upload = multer({
   }
 });
 
-// MySQL pool
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  connectionLimit: 10,
-  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false
-});
-
 // Test DB connection
-pool.getConnection()
-  .then(conn => {
+supabase.from('users').select('count').then(({ data, error }) => {
+  if (error) {
+    console.error("❌ Database connection failed:", error.message);
+  } else {
     console.log("✅ Database connected");
-    conn.release();
-  })
-  .catch(err => {
-    console.error("❌ Database connection failed:", err.message);
-  });
+  }
+});
   function getAssetFiles() {
     const distPath = path.join(path.dirname(new URL(import.meta.url).pathname), "../dist/assets");
     try {
