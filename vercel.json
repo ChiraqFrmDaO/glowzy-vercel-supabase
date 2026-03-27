@@ -1,50 +1,36 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "distDir": "dist"
-      }
-    },
-    {
-      "src": "server/index.js",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "/server/index.js"
-    },
-    {
-      "src": "/uploads/(.*)",
-      "dest": "/server/index.js"
-    },
-    {
-      "src": "/audio/(.*)",
-      "dest": "/server/index.js"
-    },
-    {
-      "src": "/backgrounds/(.*)",
-      "dest": "/server/index.js"
-    },
-    {
-      "src": "/profile-images/(.*)",
-      "dest": "/server/index.js"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/dist/$1"
-    }
-  ],
-  "env": {
-    "NODE_ENV": "production"
-  },
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "installCommand": "npm install",
+  "framework": "vite",
   "functions": {
     "server/index.js": {
       "maxDuration": 30
     }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/server/index.js"
+    },
+    {
+      "source": "/uploads/(.*)",
+      "destination": "/server/index.js"
+    },
+    {
+      "source": "/audio/(.*)",
+      "destination": "/server/index.js"
+    },
+    {
+      "source": "/backgrounds/(.*)",
+      "destination": "/server/index.js"
+    },
+    {
+      "source": "/profile-images/(.*)",
+      "destination": "/server/index.js"
+    }
+  ],
+  "env": {
+    "NODE_ENV": "production"
   }
 }
