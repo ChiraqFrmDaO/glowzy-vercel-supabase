@@ -1,7 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
-import { componentTagger } from "lovable-tagger";
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => ({
@@ -16,7 +15,7 @@ export default defineConfig(({ mode }) => ({
       '/api': 'http://localhost:3001',
     },
   },
-  plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),
+  plugins: [react()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -28,8 +27,15 @@ export default defineConfig(({ mode }) => ({
         manualChunks: {
           vendor: ['react', 'react-dom'],
           ui: ['@radix-ui/react-dialog', '@radix-ui/react-toast', 'lucide-react'],
+          router: ['react-router-dom'],
+          query: ['@tanstack/react-query']
         }
       }
-    }
+    },
+    chunkSizeWarningLimit: 1000,
+    sourcemap: false
+  },
+  define: {
+    'process.env.NODE_ENV': JSON.stringify(mode)
   }
 }));
