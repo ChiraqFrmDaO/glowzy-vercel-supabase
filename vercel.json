@@ -4,30 +4,30 @@
   "installCommand": "npm install",
   "framework": "vite",
   "functions": {
-    "server/index.js": {
+    "api/server.js": {
       "maxDuration": 30
     }
   },
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "/server/index.js"
+      "destination": "/api/server.js"
     },
     {
       "source": "/uploads/(.*)",
-      "destination": "/server/index.js"
+      "destination": "/api/server.js"
     },
     {
       "source": "/audio/(.*)",
-      "destination": "/server/index.js"
+      "destination": "/api/server.js"
     },
     {
       "source": "/backgrounds/(.*)",
-      "destination": "/server/index.js"
+      "destination": "/api/server.js"
     },
     {
       "source": "/profile-images/(.*)",
-      "destination": "/server/index.js"
+      "destination": "/api/server.js"
     }
   ],
   "env": {
