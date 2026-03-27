@@ -117,9 +117,11 @@ app.use(express.urlencoded({ extended: true, limit: "500mb" }));
 app.use("/assets", express.static(path.join(path.dirname(new URL(import.meta.url).pathname), "../dist/assets")));
 app.use(express.static(path.join(path.dirname(new URL(import.meta.url).pathname), "../dist")));
 
-// configure upload directory
-const uploadDir = path.join(process.cwd(), 'data', 'uploads');
-fs.mkdirSync(uploadDir, { recursive: true });
+// configure upload directory - use /tmp for Vercel serverless
+const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'data', 'uploads');
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
 
 // Serve uploaded files publicly (template preview images, etc.)
 app.use('/uploads', express.static(uploadDir));
@@ -127,7 +129,7 @@ app.use('/uploads', express.static(uploadDir));
 const upload = multer({ 
   dest: uploadDir,
   limits: {
-    fileSize: 500 * 1024 * 1024, // 500MB limit (for large audio/video files)
+    fileSize: parseInt(process.env.MAX_FILE_SIZE) || 500 * 1024 * 1024, // 500MB limit
   },
   fileFilter: (req, file, cb) => {
     // Accept images, audio, video, and cursor files
@@ -173,7 +175,8 @@ const pool = mysql.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  connectionLimit: 10
+  connectionLimit: 10,
+  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false
 });
 
 // Test DB connection
@@ -4134,7 +4137,13 @@ const initializeTemplatesTable = async () => {
 
 const PORT = process.env.PORT || 3001;
 
-app.listen(PORT, async () => {
-  console.log(`API running on http://localhost:${PORT}`);
-  await initializeTemplatesTable();
-});
+// For Vercel serverless functions, export the app
+export default app;
+
+// For local development, start the server
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, async () => {
+    console.log(`API running on http://localhost:${PORT}`);
+    await initializeTemplatesTable();
+  });
+}

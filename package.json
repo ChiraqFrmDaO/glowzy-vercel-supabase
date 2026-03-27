@@ -14,7 +14,8 @@
     "test:watch": "vitest",
     "server": "node server/index.js",
     "dev:all": "concurrently \"npm run server\" \"npm run dev\"",
-    "vercel-build": "npm run build"
+    "vercel-build": "npm run build",
+    "build:server": "echo 'Serverless functions are built automatically by Vercel'"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
